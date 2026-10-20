@@ -18,7 +18,7 @@
 
 ## 下载
 
-- [最新版 Releases](../../releases/latest) → `StockBar-v1.2.3-win64.zip`
+- [最新版 Releases](https://github.com/gdy4803-maker/stock-bar/releases/latest) → `StockBar-v1.2.3-win64.zip`
 - 解压后双击 `看股插件V1.2.3\看股插件V1.2.3.exe`（Windows 10/11 64 位，免安装）
 - 源码运行：见下方“方式二”
 
