@@ -1,0 +1,23 @@
+{
+  "stocks": [
+    "sh600519",
+    "sz300750",
+    "sz002594",
+    "sh688981",
+    "sz000858",
+    "sh601318"
+  ],
+  "index": "sh000001",
+  "interval_seconds": 1,
+  "opacity": 0.92,
+  "bg_opacity": 1.0,
+  "topmost": true,
+  "font_size": 12,
+  "window_pos": null,
+  "holdings": {},
+  "appearance": "pill",
+  "theme": "dark",
+  "show_name": true,
+  "cn_colors": true,
+  "card_mode": "detail"
+}
