@@ -12,7 +12,7 @@ from tkinter import messagebox, ttk
 
 import sb_data as D
 from sb_theme import (KEY_COLOR, center_on_bar, draw_round_rect,
-                      force_topmost)
+                      focus_window, force_topmost)
 from sb_widgets import (CanvasButton, Segmented, Slider, Switch, make_entry, setup_ttk)
 
 
@@ -399,6 +399,7 @@ class BaseDialog:
         force_topmost(self.win)
         self.win.lift()
         self.win.focus_force()
+        focus_window(self.win)      # OS 层焦点, 输入框/快捷键才可用
         if self.key:
             app._dialogs[self.key] = self
 
@@ -462,6 +463,7 @@ class BaseDialog:
             force_topmost(self.win)
             self.win.lift()
             self.win.focus_force()
+            focus_window(self.win)
         except tk.TclError:
             pass
 
@@ -515,8 +517,7 @@ class SettingsWindow(BaseDialog):
         super().__init__(app, "设置", 840, 750)
         self._build_footer()
         self.header("设置", "调整外观与行情，改动立即生效")
-        body = tk.Frame(self.body, bg=self.pal["panel"])
-        body.pack(fill="both", expand=True, padx=18, pady=(12, 6))
+        body = self._build_scroll_body()
         body.columnconfigure(0, weight=1, uniform="col")
         body.columnconfigure(1, weight=1, uniform="col")
         left = tk.Frame(body, bg=self.pal["panel"])
@@ -528,9 +529,69 @@ class SettingsWindow(BaseDialog):
         self._build_window(left)
         self._build_stocks(left)
         self._build_support(left)
+        self._build_repo(left)
         self._build_market(right)
         self._build_shortcuts(right)
         self._build_tips(right)
+        # 等子控件排布后再同步滚动区域
+        self.win.after_idle(self._sync_scroll_region)
+
+    def _build_scroll_body(self):
+        """设置内容可滚动: 小屏或高缩放下不会裁切底部区块。"""
+        pal = self.pal
+        setup_ttk(self.win, pal, self.fonts, self.S)
+        wrap = tk.Frame(self.body, bg=pal["panel"])
+        wrap.pack(fill="both", expand=True, padx=18, pady=(12, 6))
+        self._sb_canvas = tk.Canvas(wrap, bg=pal["panel"], highlightthickness=0, bd=0)
+        self._sb_scroll = ttk.Scrollbar(wrap, orient="vertical",
+                                        command=self._sb_canvas.yview,
+                                        style="SB.Vertical.TScrollbar")
+        self._sb_canvas.configure(yscrollcommand=self._sb_scroll.set)
+        self._sb_canvas.pack(side="left", fill="both", expand=True)
+        self._sb_scroll.pack(side="right", fill="y")
+        inner = tk.Frame(self._sb_canvas, bg=pal["panel"])
+        self._sb_inner = inner
+        self._sb_item = self._sb_canvas.create_window(
+            (0, 0), window=inner, anchor="nw", width=int(800 * self.S))
+        inner.bind("<Configure>", lambda e: self._sync_scroll_region())
+        self._sb_canvas.bind("<Configure>", self._on_scroll_canvas_resize)
+        # 滚轮
+        self._sb_canvas.bind("<Enter>", self._bind_mousewheel)
+        self._sb_canvas.bind("<Leave>", self._unbind_mousewheel)
+        return inner
+
+    def _on_scroll_canvas_resize(self, event):
+        try:
+            self._sb_canvas.itemconfigure(self._sb_item, width=event.width)
+        except (tk.TclError, AttributeError):
+            pass
+        self._sync_scroll_region()
+
+    def _sync_scroll_region(self):
+        try:
+            self._sb_canvas.configure(scrollregion=self._sb_canvas.bbox("all"))
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _bind_mousewheel(self, _event=None):
+        self.win.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, _event=None):
+        try:
+            self.win.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
+
+    def _on_mousewheel(self, event):
+        try:
+            if self._sb_canvas.winfo_exists():
+                self._sb_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except (tk.TclError, AttributeError, TypeError):
+            pass
+
+    def close(self):
+        self._unbind_mousewheel()
+        super().close()
 
     # ---- 外观 ----
     def _build_appearance(self, parent):
@@ -552,7 +613,7 @@ class SettingsWindow(BaseDialog):
         tk.Label(r, text="显示名称", bg=pal["panel_alt"], fg=pal["text_dim"],
                  font=self.fonts.label()).pack(side="right", padx=(0, 8))
         r = self.row(sec, "文字不透明度")
-        Slider(r, int(round(float(self.app.cfg["opacity"]) * 100)), 55, 100,
+        Slider(r, int(round(float(self.app.cfg["opacity"]) * 100)), 10, 100,
                self._set_opacity, pal, self.fonts, scale=S, width=236).pack(side="left", pady=2)
         r = self.row(sec, "背景不透明度")
         Slider(r, int(round(float(self.app.cfg.get("bg_opacity", 1.0)) * 100)), 0, 100,
@@ -628,6 +689,28 @@ class SettingsWindow(BaseDialog):
             except Exception:
                 self.app._dialogs.pop("support", None)
         SupportDialog(self.app)
+
+    # ---- 源码仓库 ----
+    def _build_repo(self, parent):
+        pal = self.pal
+        sec = self.section(parent, "源码仓库")
+        r = tk.Frame(sec, bg=pal["panel_alt"])
+        r.pack(fill="x", pady=2)
+        url = getattr(self.app, "repo_url", "") or "https://github.com/gdy4803-maker/stock-bar"
+        # 显示去掉协议前缀的短地址, 点击用完整 URL 打开
+        short = url.split("://", 1)[-1]
+        lab = tk.Label(r, text=short, bg=pal["panel_alt"], fg=pal["accent"],
+                       font=self.fonts.label(), cursor="hand2", anchor="w")
+        lab.pack(side="left", fill="x", expand=True)
+        lab.bind("<Button-1>", lambda e: self._open_repo())
+        CanvasButton(r, "打开仓库", self._open_repo, pal, self.fonts,
+                     kind="ghost", width=84, height=30, scale=self.S,
+                     bg=pal["panel_alt"]).pack(side="right")
+
+    def _open_repo(self):
+        import webbrowser
+        url = getattr(self.app, "repo_url", "") or "https://github.com/gdy4803-maker/stock-bar"
+        webbrowser.open(url)
 
     # ---- 行情 ----
     def _build_market(self, parent):
@@ -714,11 +797,8 @@ class SettingsWindow(BaseDialog):
         self.win.after(30, self._reopen)
 
     def _reopen(self):
-        try:
-            self.app._dialogs.pop(self.key, None)
-            self.win.destroy()
-        except tk.TclError:
-            pass
+        # 走 close() 以解绑全局滚轮并摘掉对话框引用
+        self.close()
         self.app.open_settings()
 
     def _set_font(self, value):
@@ -730,7 +810,7 @@ class SettingsWindow(BaseDialog):
         self._apply()
 
     def _set_opacity(self, value):
-        self.app.cfg["opacity"] = max(0.55, min(1.0, value / 100.0))
+        self.app.cfg["opacity"] = max(0.10, min(1.0, value / 100.0))
         self._apply()
 
     def _set_bg_opacity(self, value):
@@ -772,7 +852,9 @@ class SettingsWindow(BaseDialog):
         if not self.win.winfo_exists():
             return
         raw = self.index_var.get().strip()
-        code = D.normalize_code(raw, as_index=True) or "sh000001"
+        code = D.normalize_code(raw, as_index=True)
+        if not code or code[:2] not in ("sh", "sz", "bj") or not code[2:].isdigit():
+            code = "sh000001"
         if code != self.app.cfg["index"]:
             self.app.cfg["index"] = code
             self._apply()

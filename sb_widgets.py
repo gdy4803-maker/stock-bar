@@ -10,7 +10,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from sb_theme import UI_FAMILY, darken, draw_round_rect, force_topmost, mix
+from sb_theme import UI_FAMILY, darken, draw_round_rect, focus_window, force_topmost, mix
 
 
 # ---------------- 按钮 ----------------
@@ -417,6 +417,7 @@ class MenuPopup(tk.Toplevel):
         force_topmost(self)
         if self.parent_menu is None:
             self.focus_force()
+            focus_window(self)     # OS 层焦点, Esc 等按键才生效
             self._watch_clicks()
             self._watch_hover()
         return self

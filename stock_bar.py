@@ -41,12 +41,15 @@ except ImportError:  # pragma: no cover - 仅 Windows
 
 import sb_data as D
 import sb_ui
-from sb_theme import (Fonts, KEY_COLOR, Screen, draw_round_rect, enable_dpi_awareness,
-                      force_topmost, lighten, mix, palette)
+from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
+                      enable_dpi_awareness, focus_window, force_topmost,
+                      insert_below, lighten, mix, palette, sample_screen_rect,
+                      set_topmost, set_window_alpha)
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
+REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -120,17 +123,18 @@ def normalize_config(raw: dict | None) -> dict:
         interval = min(INTERVALS, key=lambda v: abs(v - interval))
     cfg["interval_seconds"] = interval
     try:
-        cfg["opacity"] = max(0.55, min(1.0, float(cfg.get("opacity", 0.92))))
+        cfg["opacity"] = max(0.10, min(1.0, float(cfg.get("opacity", 0.92))))
     except (TypeError, ValueError):
         cfg["opacity"] = 0.92
-    raw_has_bg = isinstance(raw, dict) and "bg_opacity" in raw
-    try:
-        bg = float(cfg.get("bg_opacity", cfg["opacity"]))
-    except (TypeError, ValueError):
-        bg = cfg["opacity"]
-    if not raw_has_bg:
-        # 旧配置迁移: 沿用原来的整体不透明度, 视觉不变
-        bg = cfg["opacity"]
+    if raw is None:
+        bg = 1.0                            # 全新配置: 背景默认不透明
+    elif isinstance(raw, dict) and "bg_opacity" in raw:
+        try:
+            bg = float(cfg.get("bg_opacity", 1.0))
+        except (TypeError, ValueError):
+            bg = 1.0
+    else:
+        bg = cfg["opacity"]                 # 旧配置迁移: 原整体不透明度视为背景
     cfg["bg_opacity"] = max(0.0, min(1.0, bg))
     try:
         cfg["font_size"] = max(10, min(16, int(cfg.get("font_size", 12))))
@@ -414,6 +418,7 @@ class StockBar:
 
     def __init__(self, cfg: dict):
         self.version = APP_VERSION
+        self.repo_url = REPO_URL
         self.base_dir = BASE_DIR
         self.cfg = normalize_config(cfg)
         self.screen = Screen()
@@ -444,11 +449,17 @@ class StockBar:
         self._w = self._h = 0
         self._first_place = True
         self._tick = 0
+        self._wall_cache = None      # (采样时间, 壁纸采样色)
+        self._text_key = None        # 文字层色键 = 文字背后合成色
+        self._bg_alpha_on = None     # 已应用的层透明度(避免无谓的属性设置)
+        self._text_alpha_on = None
+        self._topmost_on = None
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)
-        self.root.configure(bg=KEY_COLOR)
+        # 文字层: 色键 = 胶囊底色, ClearType 会混到底色上, 文字锐利无彩边
+        self.root.configure(bg=self.pal["bar_bg"])
         try:
             self.root.tk.call("tk", "scaling", self.screen.dpi / 72.0)
         except tk.TclError:
@@ -458,14 +469,14 @@ class StockBar:
         self.ui_fonts = Fonts(self.root, 12)
         self.card_fonts = Fonts(self.root, 11)
         try:
-            self.root.attributes("-transparentcolor", KEY_COLOR)
+            self.root.attributes("-transparentcolor", self.pal["bar_bg"])
         except tk.TclError:
             pass
         self.root.attributes("-alpha", self.cfg["opacity"])
         self.root.attributes("-topmost", self.cfg["topmost"])
         self._make_click_through(self.root)
 
-        self.canvas = tk.Canvas(self.root, bg=KEY_COLOR, highlightthickness=0, bd=0,
+        self.canvas = tk.Canvas(self.root, bg=self.pal["bar_bg"], highlightthickness=0, bd=0,
                                 width=10, height=10)
         self.canvas.place(x=0, y=0, width=10, height=10)
 
@@ -489,9 +500,11 @@ class StockBar:
         self.input.configure(bg=INPUT_BG)
         self.input.attributes("-topmost", self.cfg["topmost"])
         try:
-            self.input.attributes("-alpha", 0.02)
+            self.input.attributes("-alpha", 0.02)   # 先建立分层窗口
         except tk.TclError:
             pass
+        # 压到 1/255: 肉眼不可见, 但仍参与鼠标命中 (alpha=0 会失去命中)
+        set_window_alpha(self.input, 1)
         self.input_frame = tk.Frame(self.input, bg=INPUT_BG)
         self.input_frame.pack(fill="both", expand=True)
 
@@ -514,9 +527,7 @@ class StockBar:
         self._load_lists()
         self._card = sb_ui.InfoCard(self)
         self._render_bar(force=True)
-        force_topmost(self.bg)
-        force_topmost(self.root)
-        force_topmost(self.input)
+        self._restack_bar()
         self._restart_worker()
         self._after_queue = self.root.after(100, self._poll_queue)
         self._after_mouse = self.root.after(100, self._poll_mouse)
@@ -530,9 +541,18 @@ class StockBar:
             user32 = ctypes.windll.user32
             user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
             user32.SetWindowLongW.restype = ctypes.c_long
-            hwnd = win.winfo_id()
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT)
+            user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetAncestor.restype = ctypes.c_void_p
+            child = win.winfo_id()
+            frame = user32.GetAncestor(child, 2) or 0   # GA_ROOT: 真正的顶层框架
+            for hwnd in (child, frame):
+                if not hwnd:
+                    continue
+                style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
+                user32.SetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE,
+                                      style | WS_EX_TRANSPARENT)
         except Exception:
             pass
 
@@ -558,19 +578,32 @@ class StockBar:
         return self._x, self._y, max(1, self._w), max(1, self._h)
 
     # ---------- 渲染 ----------
-    def _color(self, pct) -> str:
-        if pct is None:
-            return self.pal["flat"]
-        if pct > 0:
-            return self.pal["pos"]
-        if pct < 0:
-            return self.pal["neg"]
-        return self.pal["flat"]
+    def _text_palette(self):
+        """文字配色随背景明暗自适应, 任意透明度/壁纸下都保持可读。"""
+        key = self._composite_key()
+        try:
+            lum = (0.299 * int(key[1:3], 16) + 0.587 * int(key[3:5], 16)
+                   + 0.114 * int(key[5:7], 16))
+        except Exception:
+            lum = 0.0
+        return palette("light" if lum >= 148 else "dark", bool(self.cfg.get("cn_colors", True)))
 
-    def _flash_color(self, role: str, color: str) -> str:
+    def _color(self, pct, pal=None) -> str:
+        pal = pal or self.pal
+        if pct is None:
+            return pal["flat"]
+        if pct > 0:
+            return pal["pos"]
+        if pct < 0:
+            return pal["neg"]
+        return pal["flat"]
+
+    def _flash_color(self, role: str, color: str, pal=None) -> str:
+        pal = pal or self.pal
         until = self._flash.get(role, 0)
         if until > time.time():
-            return lighten(color, 0.42)
+            # 浅色背景用压暗, 深色背景用提亮, 保证闪烁可见
+            return darken(color, 0.30) if pal.get("name") == "light" else lighten(color, 0.42)
         return color
 
     def _pct_of(self, code: str) -> float | None:
@@ -578,7 +611,7 @@ class StockBar:
         return q.pct if q else None
 
     def _bar_parts(self):
-        pal, F, S = self.pal, self.fonts, self.scale
+        pal, F, S = self._text_palette(), self.fonts, self.scale
         mode = self.cfg["appearance"]
         pick = self.quotes.get(self._current_pick_code())
         idx = self.quotes.get(self.index_code)
@@ -590,12 +623,12 @@ class StockBar:
                           "gap": gap * S, "kind": kind})
 
         pick_pct = pick.pct if pick else None
-        pick_color = self._flash_color("pick", self._color(pick_pct))
+        pick_color = self._flash_color("pick", self._color(pick_pct, pal), pal)
         pick_text = D.fmt_pct(pick_pct)
         idx_pct = idx.pct if idx else None
-        idx_color = self._flash_color("index", self._color(idx_pct))
+        idx_color = self._flash_color("index", self._color(idx_pct, pal), pal)
         idx_text = D.fmt_pct(idx_pct)
-        pnl_color = self._flash_color("pnl", self._color(pnl))
+        pnl_color = self._flash_color("pnl", self._color(pnl, pal), pal)
         pnl_text = D.fmt_pct(pnl)
         name = _short_name(pick.name, 4) if pick else ""
 
@@ -626,6 +659,86 @@ class StockBar:
             add(idx_text, F.num(), idx_color, 4, "index")
         return parts, 12 * S, 0
 
+    # ---------- 文字层色键: 与背后合成色一致, 抗锯齿无彩边 ----------
+    def _wall_color(self):
+        """采样行情条四周一圈的壁纸颜色(避开自身与详情卡), 带缓存。"""
+        now = time.time()
+        if self._wall_cache and now - self._wall_cache[0] < 20:
+            return self._wall_cache[1]
+        if self._card is not None and self._card.visible:
+            # 详情卡可能盖住采样区, 沿用旧值
+            return self._wall_cache[1] if self._wall_cache else None
+        x, y, w, h = self._x, self._y, max(1, self._w), max(1, self._h)
+        s, t = 6, 4   # 离窗口 6px, 采样条厚 4px
+        regions = ((x, y - s - t, w, t), (x, y + h + s, w, t),
+                   (x - s - t, y, t, h), (x + w + s, y, t, h))
+        rs = gs = bs = n = 0
+        for rx, ry, rw, rh in regions:
+            color = sample_screen_rect(int(rx), int(ry), int(rw), int(rh))
+            if color:
+                rs += color[0]
+                gs += color[1]
+                bs += color[2]
+                n += 1
+        if not n:
+            return self._wall_cache[1] if self._wall_cache else None
+        wall = "#%02X%02X%02X" % (rs // n, gs // n, bs // n)
+        self._wall_cache = (now, wall)
+        return wall
+
+    def _composite_key(self):
+        """文字背后的合成色: 胶囊底色按透明度混入壁纸。"""
+        bg_op = float(self.cfg.get("bg_opacity", 1.0))
+        if bg_op >= 0.995:
+            return self.pal["bar_bg"]
+        wall = self._wall_color()
+        if wall is None:
+            return self.pal["bar_bg"]
+        return mix(self.pal["bar_bg"], wall, max(0.0, 1.0 - bg_op))
+
+    def _apply_text_key(self) -> bool:
+        key = self._composite_key()
+        if key == self._text_key:
+            return False
+        self._text_key = key
+        try:
+            self.root.configure(bg=key)
+            self.canvas.configure(bg=key)
+            self.root.attributes("-transparentcolor", key)
+        except tk.TclError:
+            pass
+        return True
+
+    def _restack_bar(self):
+        """维持层级: 胶囊层 -> 文字层 -> 交互层 -> 卡片/菜单/对话框。
+
+        设置窗口属性(Tk 内部会重新布置窗口)会打乱 z 序,
+        交互层被压到下面会导致鼠标点击被背景层吞掉。
+        """
+        try:
+            if self.cfg.get("topmost", True):
+                force_topmost(self.bg)
+                force_topmost(self.root)
+                force_topmost(self.input)
+            else:
+                # 必须清掉顶层框架的 WS_EX_TOPMOST(Tk 的 -topmost 管不到),
+                # 否则"窗口置顶"开关关不掉
+                set_topmost(self.bg, False)
+                set_topmost(self.root, False)
+                set_topmost(self.input, False)
+                insert_below(self.bg, self.root)
+                insert_below(self.root, self.input)
+            if self._card is not None and getattr(self._card, "visible", False):
+                force_topmost(self._card.win)
+            if self._menu is not None:
+                force_topmost(self._menu)
+            for dlg in list(self._dialogs.values()):
+                win = getattr(dlg, "win", None)
+                if win is not None:
+                    force_topmost(win)
+        except tk.TclError:
+            pass
+
     def _render_bar(self, force: bool = False):
         if not self.root.winfo_exists():
             return
@@ -648,19 +761,29 @@ class StockBar:
         if not force and sig == getattr(self, "_bar_sig", None) and (width, h) == (self._w, self._h):
             return
         self._bar_sig = sig
-        self._resize_bar(width, h)
+        restack = self._resize_bar(width, h)
         pal = self.pal
         self.canvas.delete("all")
         self.bg_canvas.delete("all")
         bg_op = float(self.cfg.get("bg_opacity", 1.0))
         text_op = float(self.cfg.get("opacity", 1.0))
         try:
-            self.bg.attributes("-alpha", bg_op)
-            # 有背景时把文字画在背景层上, 避免色键透明层带来的彩边;
-            # 背景为 0 时只保留透明文字层。
-            self.root.attributes("-alpha", text_op if bg_op <= 0.001 else 0.0)
+            # 背景层 / 文字层各自独立透明度, 不再共用一个窗口 alpha
+            # (属性只在变化时设置: Tk 改窗口属性会打乱 z 序)
+            bg_a = max(0.0, min(1.0, bg_op))
+            if bg_a != self._bg_alpha_on:
+                self._bg_alpha_on = bg_a
+                self.bg.attributes("-alpha", bg_a)
+                restack = True
+            tx_a = max(0.0, min(1.0, text_op))
+            if tx_a != self._text_alpha_on:
+                self._text_alpha_on = tx_a
+                self.root.attributes("-alpha", tx_a)
+                restack = True
         except tk.TclError:
             pass
+        if self._apply_text_key():
+            restack = True
         if bg_op > 0.001:
             fill = pal["press"] if self._pressed else pal["bar_bg"]
             if self._error:
@@ -671,20 +794,14 @@ class StockBar:
                 border = pal["bar_border"]
             draw_round_rect(self.bg_canvas, 0.5, 0.5, width - 0.5, h - 0.5,
                             radius, fill, border, 1)
-            c = self.bg_canvas
-            fade = max(0.0, 1.0 - text_op)
-            bg_color = pal["bar_bg"]
-        else:
-            c = self.canvas
-            fade = 0.0
-            bg_color = pal["bar_bg"]
+        # 文字始终画在 root 层, 由 root 的 -alpha 控制文字不透明度
+        c = self.canvas
         x = pad
         cy = h / 2
         self._index_zone_left = None
         for p in parts:
             x += p["gap"]
-            raw = p["color"]
-            color = mix(raw, bg_color, fade) if fade > 0.001 else raw
+            color = p["color"]
             if p["kind"] == "sep":
                 c.create_line(x, h * 0.3, x, h * 0.7, fill=color)
                 x += 1
@@ -696,11 +813,13 @@ class StockBar:
                 x += p["font"].measure(p["text"])
         if self._index_zone_left is None:
             self._index_zone_left = width
+        if restack:
+            self._restack_bar()
 
-    def _resize_bar(self, w: int, h: int):
+    def _resize_bar(self, w: int, h: int) -> bool:
         w, h = max(1, int(w)), max(1, int(h))
         if (w, h) == (self._w, self._h):
-            return
+            return False
         if self._first_place:
             pos = self.cfg.get("window_pos")
             if isinstance(pos, dict):
@@ -715,11 +834,13 @@ class StockBar:
         x, y = self.screen.clamp(x, y, w, h)
         self._x, self._y = x, y
         self._w, self._h = w, h
+        self._wall_cache = None
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.canvas.place(x=0, y=0, width=w, height=h)
         self.bg.geometry(f"{w}x{h}+{x}+{y}")
         self.bg_canvas.place(x=0, y=0, width=w, height=h)
         self.input.geometry(f"{w}x{h}+{x}+{y}")
+        return True
 
     def _set_pos(self, x: int, y: int):
         x, y = self.screen.clamp(x, y, self._w, self._h)
@@ -727,6 +848,7 @@ class StockBar:
         self.root.geometry(f"+{x}+{y}")
         self.bg.geometry(f"+{x}+{y}")
         self.input.geometry(f"+{x}+{y}")
+        self._wall_cache = None   # 位置变了, 重新采样壁纸
 
     def _startup_pulse(self):
         if not self.root.winfo_exists():
@@ -745,6 +867,7 @@ class StockBar:
             self.input.focus_force()
         except tk.TclError:
             pass
+        focus_window(self.input)   # OS 层焦点, 保证快捷键可用
 
     def _on_drag(self, event):
         if not self._drag:
@@ -765,6 +888,7 @@ class StockBar:
         if abs(dx) + abs(dy) >= 4:
             self.cfg["window_pos"] = {"x": self._x, "y": self._y}
             self.save_config()
+            self._restack_bar()
         elif event.x_root - self._x < (self._index_zone_left or self._w):
             self._switch(1)
 
@@ -1040,6 +1164,12 @@ class StockBar:
 
     def _menu_closed(self):
         self._menu = None
+        # 菜单会抢走焦点, 关闭后还给交互层, 快捷键继续可用
+        try:
+            self.input.focus_force()
+        except tk.TclError:
+            pass
+        focus_window(self.input)
 
     # ---------- 设置 ----------
     def save_config(self) -> bool:
@@ -1050,15 +1180,25 @@ class StockBar:
         self.save_config()
         self.pal = palette(self.cfg["theme"], self.cfg["cn_colors"])
         self.fonts = Fonts(self.root, self.cfg["font_size"])
-        self.root.attributes("-alpha", self.cfg["opacity"])
-        self.root.attributes("-topmost", bool(self.cfg["topmost"]))
-        self.bg.attributes("-alpha", self.cfg["bg_opacity"])
-        self.bg.attributes("-topmost", bool(self.cfg["topmost"]))
-        self.input.attributes("-topmost", bool(self.cfg["topmost"]))
+        # 窗口属性只在真正变化时设置: 无谓的属性调用会打乱 z 序并触发整窗重绘
+        restack = False
+        try:
+            topmost = bool(self.cfg["topmost"])
+            if topmost != self._topmost_on:
+                self._topmost_on = topmost
+                self.root.attributes("-topmost", topmost)
+                self.bg.attributes("-topmost", topmost)
+                self.input.attributes("-topmost", topmost)
+                restack = True
+        except tk.TclError:
+            pass
         self._load_lists()
         self._bar_sig = None
+        # 透明度/文字色键由 _render_bar 按需设置, 并在必要时恢复层级
         self._render_bar(force=True)
         self._restart_worker()
+        if restack:
+            self._restack_bar()
         if self._card and self._card.visible:
             self._card.refresh()
 
@@ -1069,10 +1209,7 @@ class StockBar:
 
     def toggle_topmost(self):
         self.cfg["topmost"] = not bool(self.cfg["topmost"])
-        self.save_config()
-        self.root.attributes("-topmost", self.cfg["topmost"])
-        self.bg.attributes("-topmost", self.cfg["topmost"])
-        self.input.attributes("-topmost", self.cfg["topmost"])
+        self.apply_settings()
 
     def set_stocks(self, codes: list[str]):
         self.cfg["stocks"] = codes
@@ -1173,18 +1310,7 @@ class StockBar:
 
     # ---------- 置顶 ----------
     def _keep_on_top(self):
-        if not self.cfg.get("topmost", True):
-            return
-        if self._dialogs or self._menu:
-            return
-        try:
-            force_topmost(self.bg)
-            force_topmost(self.root)
-            force_topmost(self.input)
-            if self._card and self._card.visible:
-                force_topmost(self._card.win)
-        except tk.TclError:
-            pass
+        self._restack_bar()
 
     # ---------- 启动/退出 ----------
     def _cancel_pollers(self):

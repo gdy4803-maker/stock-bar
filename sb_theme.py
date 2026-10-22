@@ -318,6 +318,186 @@ def center_on_bar(win: tk.Misc, bar_x: int, bar_y: int, bar_w: int, bar_h: int,
     win.geometry(f"{width}x{height}+{x}+{y}")
 
 
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER),
+                ("bmiColors", wintypes.DWORD * 1)]
+
+
+def sample_screen_rect(x: int, y: int, w: int, h: int):
+    """BitBlt 屏幕区域到内存位图后采样平均色, 返回 (r, g, b) 或 None。
+
+    用于推算半透明胶囊背后的实际合成色, 让文字层的抗锯齿混色与背景一致。
+    注意: 直接 GetPixel 读屏幕 DC 非常慢(每像素毫秒级), 必须先 BitBlt + GetDIBits。
+    """
+    if w <= 0 or h <= 0:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        gdi = ctypes.windll.gdi32
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi.SelectObject.restype = ctypes.c_void_p
+        gdi.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.BitBlt.restype = ctypes.c_bool
+        gdi.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_uint]
+        gdi.GetDIBits.restype = ctypes.c_int
+        gdi.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                  ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+
+        w, h = int(w), int(h)
+        hdc = user32.GetDC(None)
+        if not hdc:
+            return None
+        mdc = gdi.CreateCompatibleDC(hdc)
+        bmp = gdi.CreateCompatibleBitmap(hdc, w, h)
+        if not mdc or not bmp:
+            if bmp:
+                gdi.DeleteObject(ctypes.c_void_p(bmp))
+            if mdc:
+                gdi.DeleteDC(ctypes.c_void_p(mdc))
+            user32.ReleaseDC(None, ctypes.c_void_p(hdc))
+            return None
+        old = gdi.SelectObject(ctypes.c_void_p(mdc), ctypes.c_void_p(bmp))
+        gdi.BitBlt(ctypes.c_void_p(mdc), 0, 0, w, h,
+                   ctypes.c_void_p(hdc), int(x), int(y), 0x00CC0020)  # SRCCOPY
+
+        bi = _BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bi.biWidth = w
+        bi.biHeight = -h          # 负值 = 自顶向下
+        bi.biPlanes = 1
+        bi.biBitCount = 32
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader = bi
+        buf = (ctypes.c_ubyte * (w * h * 4))()
+        ok = gdi.GetDIBits(ctypes.c_void_p(mdc), ctypes.c_void_p(bmp),
+                           0, h, ctypes.byref(buf), ctypes.byref(bmi), 0)
+        if old:
+            gdi.SelectObject(ctypes.c_void_p(mdc), ctypes.c_void_p(old))
+        gdi.DeleteObject(ctypes.c_void_p(bmp))
+        gdi.DeleteDC(ctypes.c_void_p(mdc))
+        user32.ReleaseDC(None, ctypes.c_void_p(hdc))
+        if not ok:
+            return None
+        # 均匀采样至多 ~256 个像素求平均
+        total = w * h
+        step = max(1, total // 256)
+        rs = gs = bs = n = 0
+        for i in range(0, total, step):
+            j = i * 4
+            bs += buf[j]
+            gs += buf[j + 1]
+            rs += buf[j + 2]
+            n += 1
+        if n == 0:
+            return None
+        return (rs // n, gs // n, bs // n)
+    except Exception:
+        return None
+
+
+def set_topmost(win: tk.Misc, topmost: bool = True) -> None:
+    """真正设置/取消顶层框架的 WS_EX_TOPMOST。
+
+    注意: Tk 的 wm attributes -topmost 只作用于内部子窗口,
+    要控制"整个窗口是否压在别的程序上", 必须对顶层框架设置。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        hwnd = user32.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        # HWND_TOPMOST(-1) / HWND_NOTOPMOST(-2); NOSIZE|NOMOVE|NOACTIVATE
+        user32.SetWindowPos(ctypes.c_void_p(hwnd),
+                            ctypes.c_void_p(-1 if topmost else -2),
+                            0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+    except Exception:
+        pass
+
+
+def focus_window(win: tk.Misc) -> None:
+    """把键盘焦点真正交给窗口(OS 层)。
+
+    Tk 的 focus_force 在无边框窗口上只更新内部焦点,
+    不保证拿到 OS 键盘焦点, 快捷键会因此失效。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.SetFocus.argtypes = [ctypes.c_void_p]
+        user32.SetFocus.restype = ctypes.c_void_p
+        child = win.winfo_id()
+        frame = user32.GetAncestor(child, 2) or child
+        user32.SetForegroundWindow(ctypes.c_void_p(frame))
+        user32.SetFocus(ctypes.c_void_p(child))
+    except Exception:
+        pass
+
+
+def set_window_alpha(win: tk.Misc, byte: int) -> None:
+    """直接设置分层窗口的 alpha 字节(1..255)。
+
+    注意: alpha=0 的窗口不参与鼠标命中测试(点击会穿过去),
+    需要接收鼠标时最小只能用 1(1/255 ≈ 0.4%, 肉眼不可见)。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        hwnd = user32.GetAncestor(win.winfo_id(), 2) or win.winfo_id()  # GA_ROOT
+        user32.SetLayeredWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                      ctypes.c_ubyte, ctypes.c_uint]
+        user32.SetLayeredWindowAttributes.restype = ctypes.c_bool
+        # LWA_ALPHA = 0x02
+        user32.SetLayeredWindowAttributes(ctypes.c_void_p(hwnd), 0,
+                                          ctypes.c_ubyte(max(1, min(255, int(byte)))), 0x02)
+    except Exception:
+        pass
+
+
+def insert_below(win: tk.Misc, above: tk.Misc) -> None:
+    """把 win 放到 above 正下方(只调整内部相对层级, 不改变置顶状态)。"""
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+
+        def frame(w):
+            return user32.GetAncestor(w.winfo_id(), 2) or w.winfo_id()
+
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        # NOSIZE | NOMOVE | NOACTIVATE
+        user32.SetWindowPos(ctypes.c_void_p(frame(win)), ctypes.c_void_p(frame(above)),
+                            0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+    except Exception:
+        pass
+
+
 def force_topmost(win: tk.Misc) -> None:
     """把窗口提到 topmost 带最前(不抢焦点), 用于悬浮条/卡片/菜单。"""
     try:
@@ -328,7 +508,8 @@ def force_topmost(win: tk.Misc) -> None:
         user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
                                         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
         user32.SetWindowPos.restype = ctypes.c_bool
+        # NOSIZE | NOMOVE | SHOWWINDOW | NOACTIVATE: 只调整层级, 不抢键盘焦点
         user32.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(-1), 0, 0, 0, 0,
-                            0x0001 | 0x0002 | 0x0040)  # NOSIZE | NOMOVE | SHOWWINDOW
+                            0x0001 | 0x0002 | 0x0040 | 0x0010)
     except Exception:
         pass

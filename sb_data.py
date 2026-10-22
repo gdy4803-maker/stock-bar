@@ -196,7 +196,11 @@ def fetch_minutes(code: str, timeout: float = 4.0) -> MinuteSeries | None:
     start = text.find("{")
     if start < 0:
         return None
-    obj = json.loads(text[start:])
+    # 接口可能带 var 前缀 / 尾随分号, 用 JSONDecoder 只取第一个对象
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
     node = (obj.get("data") or {}).get(code)
     if not isinstance(node, dict):
         return None
