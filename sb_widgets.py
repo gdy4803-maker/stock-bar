@@ -641,6 +641,71 @@ class MenuPopup(tk.Toplevel):
         super().destroy()
 
 
+class SizeHandle(tk.Frame):
+    """尺寸把手: 拖动改变相邻区域大小 / 窗口大小。
+
+    orient: "ns" 上下拖(横贯整行) | "ew" 左右拖(竖贯整列) | "nwse" 角(双向)
+    on_drag(dx, dy) 由调用方分配增量(自行限幅); on_release() 在松手时回调。
+    """
+
+    CURSORS = {"ns": "sb_v_double_arrow", "ew": "sb_h_double_arrow",
+               "nwse": "size_nw_se", "nesw": "size_ne_sw"}
+
+    def __init__(self, parent, on_drag, pal, scale=1.0, orient="ns",
+                 thick=7, on_release=None):
+        self.orient = orient
+        self._on_drag = on_drag
+        self._on_release = on_release
+        self._pal = pal
+        self._last = None
+        t = max(4, int(thick * scale))
+        corner = orient in ("nwse", "nesw")
+        w = t if orient == "ew" else (t if corner else 10)
+        h = t if orient == "ns" else (t if corner else 10)
+        super().__init__(parent, bg=pal["border_soft"], cursor=self.CURSORS[orient],
+                         width=w, height=h, highlightthickness=0)
+        self.pack_propagate(False)
+        self.grip = tk.Frame(self, bg=pal["border"], highlightthickness=0)
+        if orient == "ns":
+            self.grip.place(relx=0.5, rely=0.5, anchor="center",
+                            width=int(34 * scale), height=2)
+        elif orient == "ew":
+            self.grip.place(relx=0.5, rely=0.5, anchor="center",
+                            width=2, height=int(34 * scale))
+        else:
+            self.grip.place(relx=0.5, rely=0.5, anchor="center",
+                            width=int(11 * scale), height=int(11 * scale))
+        for wdg in (self, self.grip):
+            wdg.bind("<Button-1>", self._press)
+            wdg.bind("<B1-Motion>", self._drag)
+            wdg.bind("<ButtonRelease-1>", self._up)
+            wdg.bind("<Enter>", lambda e: self._hover(True))
+            wdg.bind("<Leave>", lambda e: self._hover(False))
+
+    def _hover(self, on):
+        try:
+            self.configure(bg=self._pal["accent"] if on else self._pal["border_soft"])
+            self.grip.configure(bg=self._pal["text_dim"] if on else self._pal["border"])
+        except tk.TclError:
+            pass
+
+    def _press(self, event):
+        self._last = (event.x_root, event.y_root)
+
+    def _drag(self, event):
+        if self._last is None:
+            return
+        dx = event.x_root - self._last[0]
+        dy = event.y_root - self._last[1]
+        self._last = (event.x_root, event.y_root)
+        self._on_drag(dx, dy)
+
+    def _up(self, _event):
+        self._last = None
+        if self._on_release:
+            self._on_release()
+
+
 # ---------------- 深色菜单/表格辅助 ----------------
 def setup_ttk(root, pal, fonts, scale=1.0):
     style = ttk.Style(root)

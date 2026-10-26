@@ -27,6 +27,7 @@ import ctypes
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -48,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.8"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -73,11 +74,14 @@ DEFAULT_CONFIG = {
     "font_size": 12,
     "window_pos": None,
     "holdings": {},
+    "holdings_layout": {},           # 持仓窗口布局记忆(尺寸/两个列表高度)
+    "fees": dict(D.DEFAULT_FEES),   # 交易手续费: 佣金费率/起收/印花税
     "appearance": "pill",     # pill=胶囊(带名称) | compact=紧凑(仅数字)
     "theme": "dark",          # dark | light
     "show_name": True,        # 胶囊里是否显示股票名称
     "cn_colors": True,        # True=红涨绿跌, False=绿涨红跌
     "card_mode": "detail",    # detail=详细(含分时图) | simple=简洁(纯文字)
+    "dock_taskbar": False,    # True=嵌入任务栏(左), 拖动只在任务栏内滑动
 }
 
 INPUT_BG = "#0B0C10"
@@ -97,6 +101,7 @@ def _default_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     cfg["stocks"] = list(DEFAULT_CONFIG["stocks"])
     cfg["holdings"] = {}
+    cfg["fees"] = dict(DEFAULT_CONFIG["fees"])
     return cfg
 
 
@@ -151,6 +156,7 @@ def normalize_config(raw: dict | None) -> dict:
         cfg["card_mode"] = "detail"
     if cfg.get("theme") not in ("dark", "light"):
         cfg["theme"] = "dark"
+    cfg["dock_taskbar"] = bool(cfg.get("dock_taskbar", False))
     pos = cfg.get("window_pos")
     if not (isinstance(pos, dict) and isinstance(pos.get("x"), (int, float))
             and isinstance(pos.get("y"), (int, float))):
@@ -162,21 +168,71 @@ def normalize_config(raw: dict | None) -> dict:
         code = D.normalize_code(code)
         if not code:
             continue
-        try:
-            lots = int(h.get("lots", 0))
-        except (TypeError, ValueError):
-            continue
-        if lots <= 0:
-            continue
-        entry = {"lots": lots}
-        try:
-            cost = float(h.get("cost")) if h.get("cost") else 0.0
-        except (TypeError, ValueError):
-            cost = 0.0
-        if cost > 0:
-            entry["cost"] = round(cost, 4)
-        holdings[code] = entry
+        trades = []
+        raw_trades = h.get("trades")
+        if isinstance(raw_trades, list):
+            for t in raw_trades:
+                if not isinstance(t, dict):
+                    continue
+                side = t.get("side")
+                if side not in ("buy", "sell"):
+                    continue
+                try:
+                    price = float(t.get("price") or 0)
+                    lots = int(t.get("lots") or 0)
+                    fee = float(t.get("fee") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if lots <= 0 or price < 0:
+                    continue
+                trades.append({
+                    "time": str(t.get("time") or "")[:24],
+                    "side": side,
+                    "price": round(price, 4),
+                    "lots": lots,
+                    "fee": round(max(0.0, fee), 2),
+                    "note": str(t.get("note") or "")[:40],
+                })
+        else:
+            # 旧格式(手数+成本价)迁移为一条"期初持仓"买入记录
+            try:
+                lots = int(h.get("lots", 0))
+            except (TypeError, ValueError):
+                lots = 0
+            try:
+                cost = float(h.get("cost")) if h.get("cost") else 0.0
+            except (TypeError, ValueError):
+                cost = 0.0
+            if lots > 0:
+                trades.append({"time": "期初", "side": "buy",
+                               "price": round(max(0.0, cost), 4),
+                               "lots": lots, "fee": 0.0, "note": "期初持仓"})
+        if trades:
+            holdings[code] = {"trades": trades}
     cfg["holdings"] = holdings
+    # 交易手续费(可配置): 缺项/非法值回落默认
+    fees = dict(D.DEFAULT_FEES)
+    for k, v in (cfg.get("fees") or {}).items():
+        if k in fees:
+            try:
+                fv = float(v)
+                if fv >= 0:
+                    fees[k] = fv
+            except (TypeError, ValueError):
+                pass
+    cfg["fees"] = fees
+    # 持仓窗口布局记忆
+    lay = cfg.get("holdings_layout")
+    clean_lay = {}
+    if isinstance(lay, dict):
+        for k in ("w", "h", "h_top", "h_log"):
+            try:
+                v = int(lay.get(k) or 0)
+                if v > 0:
+                    clean_lay[k] = v
+            except (TypeError, ValueError):
+                pass
+    cfg["holdings_layout"] = clean_lay
     return cfg
 
 
@@ -229,15 +285,24 @@ def _index_short(name: str) -> str:
 
 
 # ---------------- 开机自启 ----------------
-def _autostart_command() -> str:
+TASK_NAME = "StockBar"
+
+
+def _autostart_parts() -> tuple[str, str]:
+    """返回 (程序路径, 参数)。"""
     if getattr(sys, "frozen", False):
-        return f'"{os.path.abspath(sys.executable)}"'
+        return os.path.abspath(sys.executable), ""
     exe = sys.executable
     if exe.lower().endswith("python.exe"):
         cand = exe[:-len("python.exe")] + "pythonw.exe"
         if os.path.exists(cand):
             exe = cand
-    return f'"{exe}" "{os.path.join(BASE_DIR, "stock_bar.py")}"'
+    return exe, f'"{os.path.join(BASE_DIR, "stock_bar.py")}"'
+
+
+def _autostart_command() -> str:
+    exe, args = _autostart_parts()
+    return f'"{exe}" {args}'.rstrip()
 
 
 def _startup_vbs() -> str:
@@ -274,58 +339,131 @@ def _remove_startup_vbs() -> None:
             pass
 
 
-def is_autostart() -> bool:
-    if any(os.path.exists(p) for p in STARTUP_FILES):
-        return True
-    if winreg is None:
-        return False
+def _sched_task_exists() -> bool:
+    """计划任务方式的开机自启是否已注册。"""
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            winreg.QueryValueEx(key, RUN_VALUE)
-        return True
+        p = subprocess.run(["schtasks", "/query", "/tn", TASK_NAME],
+                           capture_output=True, timeout=10)
+        return p.returncode == 0
     except Exception:
         return False
 
 
-def set_autostart(enabled: bool) -> bool:
-    registry_ok = False
-    error = None
+def _write_sched_task() -> bool:
+    """用计划任务(登录触发)注册开机自启 —— 注册表/启动文件夹被安全软件拦截时的第三通道。
+
+    当前用户可在不提权的情况下注册自己的登录任务(PowerShell TaskScheduler cmdlet)。
+    """
+    exe, args = _autostart_parts()
+
+    def q(s: str) -> str:
+        return s.replace("'", "''")
+
+    ps = (
+        "$a=New-ScheduledTaskAction -Execute '%s' -Argument '%s';"
+        "$t=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
+        "Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t "
+        "-RunLevel Limited -Force | Out-Null"
+    ) % (q(exe), q(args), q(TASK_NAME))
+    try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True, timeout=40)
+        ok = p.returncode == 0 and _sched_task_exists()
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            err = (p.stderr or b"").decode("mbcs", "ignore").strip()
+        except Exception:
+            err = "?"
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") +
+                        f"计划任务自启注册失败: {err}\n")
+        except OSError:
+            pass
+    return ok
+
+
+def _remove_sched_task() -> None:
+    try:
+        subprocess.run(["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
+                       capture_output=True, timeout=20)
+    except Exception:
+        pass
+    if _sched_task_exists():
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false"],
+                capture_output=True, timeout=30)
+        except Exception:
+            pass
+
+
+def is_autostart() -> bool:
+    if any(os.path.exists(p) for p in STARTUP_FILES):
+        return True
     if winreg is not None:
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                                winreg.KEY_SET_VALUE) as key:
-                if enabled:
-                    winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ,
-                                      _autostart_command())
-                else:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                winreg.QueryValueEx(key, RUN_VALUE)
+            return True
+        except Exception:
+            pass
+    return _sched_task_exists()
+
+
+def set_autostart(enabled: bool) -> bool:
+    """依次尝试: 注册表 Run -> 启动文件夹 VBS -> 计划任务。
+
+    前两条容易被安全软件(如火绒"启动项防护")拦截, 计划任务是另一条通道。
+    """
+    if not enabled:
+        if winreg is not None:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as key:
                     try:
                         winreg.DeleteValue(key, RUN_VALUE)
                     except FileNotFoundError:
                         pass
-            registry_ok = True
-        except Exception as exc:
-            error = exc
-    if enabled:
-        if registry_ok:
+            except Exception:
+                pass
+        _remove_startup_vbs()
+        _remove_sched_task()
+        return not is_autostart()
+
+    errors = []
+    # 1) 注册表
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ,
+                                  _autostart_command())
             _remove_startup_vbs()
+            _remove_sched_task()
             return True
-        ok = _write_startup_vbs()
-        try:
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") +
-                        f"注册表自启不可用({error!r}), 改用启动文件夹: {ok}\n")
-        except OSError:
-            pass
-        return ok and is_autostart()
-    _remove_startup_vbs()
-    if not registry_ok and winreg is not None:
-        try:
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") +
-                        f"取消注册表自启失败: {error!r}\n")
-        except OSError:
-            pass
-    return not is_autostart()
+        except Exception as exc:
+            errors.append(f"注册表: {exc!r}")
+    # 2) 启动文件夹
+    if _write_startup_vbs():
+        _remove_sched_task()
+        return True
+    errors.append("启动文件夹: 被拒绝")
+    # 3) 计划任务
+    if _write_sched_task():
+        return True
+    errors.append("计划任务: 被拒绝")
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") +
+                    "写入开机自启失败(三种方式): " + " | ".join(errors) + "\n")
+    except OSError:
+        pass
+    return False
 
 
 # ---------------- 单实例 ----------------
@@ -659,6 +797,12 @@ class StockBar:
             add(idx_text, F.num(), idx_color, 4, "index")
         return parts, 12 * S, 0
 
+    def _effective_bg_op(self) -> float:
+        """实际生效的背景不透明度: 嵌入任务栏时不画胶囊底色。"""
+        if self.cfg.get("dock_taskbar"):
+            return 0.0
+        return max(0.0, min(1.0, float(self.cfg.get("bg_opacity", 1.0))))
+
     # ---------- 文字层色键: 与背后合成色一致, 抗锯齿无彩边 ----------
     def _wall_color(self):
         """采样行情条四周一圈的壁纸颜色(避开自身与详情卡), 带缓存。"""
@@ -674,7 +818,14 @@ class StockBar:
                    (x - s - t, y, t, h), (x + w + s, y, t, h))
         rs = gs = bs = n = 0
         for rx, ry, rw, rh in regions:
-            color = sample_screen_rect(int(rx), int(ry), int(rw), int(rh))
+            # 裁剪到虚拟屏幕内: 屏幕外会采到黑边, 把合成色算偏
+            x0 = max(int(rx), self.screen.vx)
+            y0 = max(int(ry), self.screen.vy)
+            x1 = min(int(rx + rw), self.screen.vx + self.screen.vw)
+            y1 = min(int(ry + rh), self.screen.vy + self.screen.vh)
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                continue
+            color = sample_screen_rect(x0, y0, x1 - x0, y1 - y0)
             if color:
                 rs += color[0]
                 gs += color[1]
@@ -688,7 +839,7 @@ class StockBar:
 
     def _composite_key(self):
         """文字背后的合成色: 胶囊底色按透明度混入壁纸。"""
-        bg_op = float(self.cfg.get("bg_opacity", 1.0))
+        bg_op = self._effective_bg_op()
         if bg_op >= 0.995:
             return self.pal["bar_bg"]
         wall = self._wall_color()
@@ -756,17 +907,19 @@ class StockBar:
         sig = (self.cfg["appearance"], self.cfg["show_name"], self.cfg["theme"],
                self.cfg["font_size"], round(self.cfg["opacity"], 2),
                round(float(self.cfg.get("bg_opacity", 1.0)), 2),
+               bool(self.cfg.get("dock_taskbar")),
                self._hovering, self._pressed, self._error,
                tuple((p["text"], p["color"], round(p["gap"], 1)) for p in parts))
         if not force and sig == getattr(self, "_bar_sig", None) and (width, h) == (self._w, self._h):
             return
         self._bar_sig = sig
-        restack = self._resize_bar(width, h)
         pal = self.pal
         self.canvas.delete("all")
         self.bg_canvas.delete("all")
-        bg_op = float(self.cfg.get("bg_opacity", 1.0))
+        # 嵌入任务栏时不画胶囊底色: 文字直接落在任务栏上, 像天气组件一样"长"在任务栏里
+        bg_op = self._effective_bg_op()
         text_op = float(self.cfg.get("opacity", 1.0))
+        restack = False
         try:
             # 背景层 / 文字层各自独立透明度, 不再共用一个窗口 alpha
             # (属性只在变化时设置: Tk 改窗口属性会打乱 z 序)
@@ -784,6 +937,9 @@ class StockBar:
             pass
         if self._apply_text_key():
             restack = True
+        # 属性变化落定后再改几何: Tk 的 geometry() 是异步的,
+        # 属性触发的窗口刷新会把未落地的移动请求冲掉
+        restack = self._resize_bar(width, h) or restack
         if bg_op > 0.001:
             fill = pal["press"] if self._pressed else pal["bar_bg"]
             if self._error:
@@ -831,6 +987,8 @@ class StockBar:
             self._first_place = False
         else:
             x, y = self._x, self._y
+        if self.cfg.get("dock_taskbar"):
+            x, y = self._dock_pos(w, h)      # 嵌入任务栏(左): 位置由任务栏决定
         x, y = self.screen.clamp(x, y, w, h)
         self._x, self._y = x, y
         self._w, self._h = w, h
@@ -840,6 +998,7 @@ class StockBar:
         self.bg.geometry(f"{w}x{h}+{x}+{y}")
         self.bg_canvas.place(x=0, y=0, width=w, height=h)
         self.input.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.update_idletasks()   # 先落地, 避免被后续层级维护冲掉
         return True
 
     def _set_pos(self, x: int, y: int):
@@ -848,6 +1007,9 @@ class StockBar:
         self.root.geometry(f"+{x}+{y}")
         self.bg.geometry(f"+{x}+{y}")
         self.input.geometry(f"+{x}+{y}")
+        # Tk 的 geometry() 异步生效: 若随后有 SetWindowPos(层级维护)会把移动冲掉,
+        # 这里立刻落位
+        self.root.update_idletasks()
         self._wall_cache = None   # 位置变了, 重新采样壁纸
 
     def _startup_pulse(self):
@@ -874,6 +1036,12 @@ class StockBar:
             return
         dx = event.x_root - self._drag[0]
         dy = event.y_root - self._drag[1]
+        if self.cfg.get("dock_taskbar"):
+            # 嵌入模式: 只在任务栏条带内左右滑动
+            bx, by, bw, bh = self.screen.taskbar_band(event.x_root, event.y_root)
+            nx = max(bx, min(self._drag[2] + dx, bx + bw - self._w))
+            self._set_pos(nx, by + max(0, (bh - self._h) // 2))
+            return
         self._set_pos(self._drag[2] + dx, self._drag[3] + dy)
 
     def _on_release(self, event):
@@ -974,6 +1142,9 @@ class StockBar:
     # ---------- 数据 ----------
     def _restart_worker(self, force: bool = False):
         codes = [c for c in self.pick_codes if c]
+        for c in (self.cfg.get("holdings") or {}):
+            if c and c not in codes:
+                codes.append(c)   # 持仓但不在自选的也要拉行情
         if self.index_code and self.index_code not in codes:
             codes.append(self.index_code)
         interval = max(0.5, float(self.cfg["interval_seconds"]))
@@ -1034,7 +1205,9 @@ class StockBar:
         except queue.Empty:
             pass
         self._tick += 1
-        if self._tick % 20 == 0:
+        # 嵌入任务栏时任务栏会把自己抬到最上层, 需要更频繁地压回去
+        every = 3 if self.cfg.get("dock_taskbar") else 20
+        if self._tick % every == 0:
             self._keep_on_top()
         try:
             self._after_queue = self.root.after(100, self._poll_queue)
@@ -1076,12 +1249,19 @@ class StockBar:
         total_pnl = 0.0
         total_base = 0.0
         holdings = self.cfg.get("holdings", {})
-        for code in self.pick_codes:
+        codes = [c for c in self.pick_codes if c]
+        for c in holdings:
+            if c and c not in codes:
+                codes.append(c)
+        for code in codes:
             h = holdings.get(code)
             q = self.quotes.get(code)
-            if not h or not h.get("lots") or not q:
+            if not h or not q:
                 continue
-            shares = int(h["lots"]) * 100
+            pos, _ = D.position_of(h.get("trades"))
+            if pos.lots <= 0:
+                continue
+            shares = pos.lots * 100
             total_pnl += (q.price - q.prev_close) * shares
             total_base += q.prev_close * shares
         if not total_base:
@@ -1148,6 +1328,9 @@ class StockBar:
         items.append({"type": "sub", "label": "刷新间隔", "items": iv_items})
         items.append({"type": "check", "label": "窗口置顶", "checked": bool(self.cfg["topmost"]),
                       "command": self.toggle_topmost})
+        items.append({"type": "check", "label": "嵌入任务栏（左）",
+                      "checked": bool(self.cfg.get("dock_taskbar")),
+                      "command": self.toggle_dock})
         items.append({"type": "sep"})
         items.append({"type": "cmd", "label": "复制当前行情", "shortcut": "Ctrl+C",
                       "command": self.copy_quotes})
@@ -1275,7 +1458,38 @@ class StockBar:
         except OSError:
             pass
 
+    # ---------- 任务栏嵌入 ----------
+    def _dock_pos(self, w: int | None = None, h: int | None = None) -> tuple[int, int]:
+        """嵌入任务栏(左)时的目标坐标: 优先落在任务栏空位上, 垂直居中。"""
+        w = self._w if w is None else w
+        h = self._h if h is None else h
+        bx, by, bw, bh = self.screen.taskbar_band(self._x + self._w // 2,
+                                                 self._y + self._h // 2)
+        # 找任务栏里的空位(避开天气组件/开始按钮等已有元素), 找不到才贴左端
+        gap = self.screen.find_free_span(bx, by, bw, bh, w + int(24 * self.scale),
+                                        ignore=(self._x, self._x + self._w))
+        x = gap if gap is not None else bx + int(12 * self.scale)
+        y = by + max(0, (bh - h) // 2)
+        return self.screen.clamp(x, y, w, h)
+
+    def set_dock(self, enabled: bool):
+        self.cfg["dock_taskbar"] = bool(enabled)
+        # 先渲染(把 alpha/色键等属性变化落定), 再移动:
+        # Tk 的 geometry() 是异步的, 属性变化会把未落地的移动请求弄丢
+        self._render_bar(force=True)
+        if enabled:
+            self._set_pos(*self._dock_pos())
+            self._dock_band = self.screen.taskbar_band(self._x + self._w // 2,
+                                                       self._y + self._h // 2)
+            self.cfg["window_pos"] = {"x": self._x, "y": self._y}
+        self.save_config()
+        self._restack_bar()
+
+    def toggle_dock(self):
+        self.set_dock(not bool(self.cfg.get("dock_taskbar")))
+
     def move_to_corner(self):
+        self.cfg["dock_taskbar"] = False
         wx, wy, ww, wh = self.screen.work_area(self.screen.vx + 100, self.screen.vy + 100)
         x = wx + ww - self._w - int(18 * self.scale)
         y = wy + wh - self._h - int(10 * self.scale)
@@ -1293,9 +1507,11 @@ class StockBar:
             lines.append(f"{q.name}({D.code_digits(code)}) {D.fmt_price(q.price, q.dp)} "
                          f"{D.fmt_change(q.change, q.dp)} {D.fmt_pct(q.pct)}")
             h = self.cfg.get("holdings", {}).get(code)
-            if h and h.get("lots") and not q.is_index:
-                dpnl = (q.price - q.prev_close) * int(h["lots"]) * 100
-                lines.append(f"    持仓 {int(h['lots'])}手  当日盈亏 {D.fmt_money_signed(dpnl)}")
+            if h and not q.is_index:
+                pos, _ = D.position_of(h.get("trades"))
+                if pos.lots > 0:
+                    dpnl = (q.price - q.prev_close) * pos.lots * 100
+                    lines.append(f"    持仓 {pos.lots}手  当日盈亏 {D.fmt_money_signed(dpnl)}")
         try:
             self.input.clipboard_clear()
             self.input.clipboard_append("\n".join(lines))
@@ -1311,6 +1527,12 @@ class StockBar:
     # ---------- 置顶 ----------
     def _keep_on_top(self):
         self._restack_bar()
+        if self.cfg.get("dock_taskbar"):
+            # 任务栏位置/高度变化(换显示器、改设置等)时重新嵌入
+            band = self.screen.taskbar_band(self._x + self._w // 2, self._y + self._h // 2)
+            if band != getattr(self, "_dock_band", None):
+                self._dock_band = band
+                self._set_pos(*self._dock_pos())
 
     # ---------- 启动/退出 ----------
     def _cancel_pollers(self):

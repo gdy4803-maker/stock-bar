@@ -7,13 +7,15 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import sb_data as D
 from sb_theme import (KEY_COLOR, center_on_bar, draw_round_rect,
                       focus_window, force_topmost)
-from sb_widgets import (CanvasButton, Segmented, Slider, Switch, make_entry, setup_ttk)
+from sb_widgets import (CanvasButton, Segmented, SizeHandle, Slider, Switch,
+                        make_entry, setup_ttk)
 
 
 def _text_run(canvas, x, y, parts, anchor="w"):
@@ -119,12 +121,14 @@ class InfoCard:
 
     # ---------- 布局 ----------
     def _holding(self, q):
+        """返回该股持仓(模拟盘推导的 Position)或 None。"""
         if q.is_index:
             return None
         h = self.app.cfg.get("holdings", {}).get(q.code)
-        if h and h.get("lots"):
-            return h
-        return None
+        if not h:
+            return None
+        pos, _ = D.position_of(h.get("trades"))
+        return pos if pos.lots > 0 else None
 
     def _plan(self, q):
         S = self.app.scale * 0.875
@@ -246,16 +250,20 @@ class InfoCard:
         hold = self._holding(q)
         if hold:
             c.create_line(pad, p["hdiv"], w - pad, p["hdiv"], fill=pal["border_soft"])
-            lots = int(hold.get("lots", 0))
+            lots = hold.lots
             shares = lots * 100
             mv = q.price * shares
             dpnl = (q.price - q.prev_close) * shares
             left = [("持仓 ", fonts.label(), pal["muted"]),
                     (f"{lots}手", fonts.label(), pal["text_dim"])]
-            if hold.get("cost"):
+            if hold.avg_cost > 0:
                 left += [("    成本 ", fonts.label(), pal["muted"]),
-                         (D.fmt_price(float(hold["cost"]), q.dp), fonts.num(-2, False),
+                         (D.fmt_price(hold.avg_cost, q.dp), fonts.num(-2, False),
                           pal["text_dim"])]
+            if abs(hold.realized) > 0.004:
+                left += [("    已实现 ", fonts.label(), pal["muted"]),
+                         (D.fmt_money_signed(hold.realized), fonts.num(-2, True),
+                          D.change_color(hold.realized, pal))]
             _text_run(c, pad, p["hold1"], left)
             _text_run(c, w - pad, p["hold1"],
                       [("市值 ", fonts.label(), pal["muted"]),
@@ -264,12 +272,12 @@ class InfoCard:
             _text_run(c, pad, p["hold2"],
                       [("当日 ", fonts.label(), pal["muted"]),
                        (D.fmt_money_signed(dpnl), fonts.num(-2, True), D.change_color(dpnl, pal))])
-            if hold.get("cost"):
-                cp = (q.price - float(hold["cost"])) * shares
+            if hold.avg_cost > 0:
+                fp = (q.price - hold.avg_cost) * shares
                 _text_run(c, w - pad, p["hold2"],
-                          [("累计 ", fonts.label(), pal["muted"]),
-                           (D.fmt_money_signed(cp), fonts.num(-2, True),
-                            D.change_color(cp, pal))],
+                          [("浮动 ", fonts.label(), pal["muted"]),
+                           (D.fmt_money_signed(fp), fonts.num(-2, True),
+                            D.change_color(fp, pal))],
                           anchor="e")
 
         # 页脚
@@ -421,6 +429,96 @@ class BaseDialog:
         except Exception:
             pass
 
+    # ---- 窗口拉伸(与普通窗口一致: 4 边 + 4 角, 8 个方向) ----
+    def make_resizable(self, min_w, min_h, on_resize=None, on_release=None):
+        """开放 8 个方向拖拽改变窗口大小(带最小尺寸/屏幕边界限制)。"""
+        self._min_w = int(min_w)
+        self._min_h = int(min_h)
+        self._on_resize_cb = on_resize
+        self._on_resize_release_cb = on_release
+        self._round_at = 0.0
+        S = self.S
+        edge = max(5, int(6 * S))          # 边命中宽度
+        corner = max(12, int(16 * S))      # 角命中宽度
+        zones = (
+            ("n", "ns", dict(relx=0.5, rely=0.0, anchor="n", relwidth=1.0, height=edge)),
+            ("s", "ns", dict(relx=0.5, rely=1.0, anchor="s", relwidth=1.0, height=edge)),
+            ("w", "ew", dict(relx=0.0, rely=0.5, anchor="w", relheight=1.0, width=edge)),
+            ("e", "ew", dict(relx=1.0, rely=0.5, anchor="e", relheight=1.0, width=edge)),
+            ("nw", "nwse", dict(relx=0.0, rely=0.0, anchor="nw", width=corner, height=corner)),
+            ("ne", "nesw", dict(relx=1.0, rely=0.0, anchor="ne", width=corner, height=corner)),
+            ("sw", "nesw", dict(relx=0.0, rely=1.0, anchor="sw", width=corner, height=corner)),
+            ("se", "nwse", dict(relx=1.0, rely=1.0, anchor="se", width=corner, height=corner)),
+        )
+        for zone, orient, geo in zones:
+            h = SizeHandle(self.win,
+                           lambda dx, dy, z=zone: self._resize(dx, dy, z),
+                           self.pal, S, orient, thick=edge if orient in ("ns", "ew") else corner,
+                           on_release=self._resize_done)
+            h.place(**geo)
+
+    def _resize(self, dx, dy, zone):
+        x, y = self.win.winfo_x(), self.win.winfo_y()
+        w, h = self.win.winfo_width(), self.win.winfo_height()
+        if "e" in zone:
+            w += dx
+        if "s" in zone:
+            h += dy
+        if "w" in zone:
+            w -= dx
+            x += dx
+        if "n" in zone:
+            h -= dy
+            y += dy
+        # 最小尺寸: 夹住拖动边, 对边保持不动
+        if w < self._min_w:
+            if "w" in zone:
+                x -= self._min_w - w
+            w = self._min_w
+        if h < self._min_h:
+            if "n" in zone:
+                y -= self._min_h - h
+            h = self._min_h
+        # 屏幕边界: 不移出可视区, 也不撑出屏幕
+        scr = self.app.screen
+        x = max(scr.vx + 4, min(x, scr.vx + scr.vw - w - 4))
+        y = max(scr.vy + 4, min(y, scr.vy + scr.vh - h - 4))
+        if (w, h, x, y) == (self.win.winfo_width(), self.win.winfo_height(),
+                            self.win.winfo_x(), self.win.winfo_y()):
+            return
+        # 只改几何(轻量), 强制同步重排是卡顿来源
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        # 圆角延后补画: 紧跟 geometry 的 SetWindowRgn 会把未生效的移动冲掉
+        self._request_round()
+        if self._on_resize_cb:
+            self._on_resize_cb(w, h)
+
+    def _request_round(self):
+        """延后补画圆角(合并到下一拍, 拖动中不逐次重绘)。"""
+        if getattr(self, "_round_pending", False):
+            return
+        self._round_pending = True
+        try:
+            self.win.after(30, self._round_later)
+        except tk.TclError:
+            self._round_pending = False
+
+    def _round_later(self):
+        self._round_pending = False
+        try:
+            if self.win.winfo_exists():
+                self._round_corners()
+        except tk.TclError:
+            pass
+
+    def _resize_done(self):
+        self.win.update_idletasks()
+        self._round_corners()
+        if self._on_resize_cb:
+            self._on_resize_cb(self.win.winfo_width(), self.win.winfo_height())
+        if self._on_resize_release_cb:
+            self._on_resize_release_cb()
+
     def _build_titlebar(self):
         pal, F, S = self.pal, self.fonts, self.S
         tb = tk.Frame(self.shell, bg=pal["panel_alt"], height=int(38 * S))
@@ -531,6 +629,7 @@ class SettingsWindow(BaseDialog):
         self._build_support(left)
         self._build_repo(left)
         self._build_market(right)
+        self._build_fees(right)
         self._build_shortcuts(right)
         self._build_tips(right)
         # 等子控件排布后再同步滚动区域
@@ -626,6 +725,13 @@ class SettingsWindow(BaseDialog):
         Switch(r, bool(self.app.cfg["topmost"]), self._set_topmost, pal, self.S).pack(side="left", pady=2)
         tk.Label(r, text="让行情条始终浮在其他窗口之上", bg=pal["panel_alt"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
+        r = self.row(sec, "嵌入任务栏")
+        self.dock_sw = Switch(r, bool(self.app.cfg.get("dock_taskbar")), self._set_dock,
+                              pal, self.S)
+        self.dock_sw.pack(side="left", pady=2)
+        tk.Label(r, text="像天气组件一样长在任务栏上（自动找空位、无底色、可左右拖）",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "开机启动")
         self.autostart_sw = Switch(r, bool(self.app.is_autostart()), self._set_autostart,
                                    pal, self.S)
@@ -745,6 +851,55 @@ class SettingsWindow(BaseDialog):
         tk.Label(r, text="简洁 = 不含分时图", bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
 
+    # ---- 交易手续费 ----
+    _FEE_WAN = ("stock_rate", "fund_rate", "stamp_rate")
+
+    def _fmt_fee(self, key):
+        try:
+            v = float(self.app.cfg.get("fees", {}).get(key, 0) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if key in self._FEE_WAN:
+            v *= 10000.0
+        return ("%.4f" % v).rstrip("0").rstrip(".") or "0"
+
+    def _set_fee(self, key, var):
+        try:
+            v = float(var.get() or 0)
+        except ValueError:
+            return
+        if key in self._FEE_WAN:
+            v = v / 10000.0
+        if v < 0:
+            v = 0.0
+        self.app.cfg.setdefault("fees", {})[key] = round(v, 8)
+        self._apply()
+
+    def _build_fees(self, parent):
+        pal = self.pal
+        sec = self.section(parent, "交易手续费")
+        self.fee_vars = {}
+
+        def fee_row(label, fields):
+            r = self.row(sec, label)
+            for key, cap, width in fields:
+                var = tk.StringVar(value=self._fmt_fee(key))
+                ent = make_entry(r, pal, self.fonts, width=width, textvariable=var,
+                                 numeric=True)
+                ent.pack(side="left", ipady=4)
+                ent.bind("<Return>", lambda e, k=key, v=var: self._set_fee(k, v))
+                ent.bind("<FocusOut>", lambda e, k=key, v=var: self._set_fee(k, v))
+                self.fee_vars[key] = var
+                tk.Label(r, text=cap, bg=pal["panel_alt"], fg=pal["faint"],
+                         font=self.fonts.tiny()).pack(side="left", padx=(6, 12))
+
+        fee_row("股票佣金", [("stock_rate", "万分之", 6), ("stock_min", "元起收", 6)])
+        fee_row("ETF 佣金", [("fund_rate", "万分之", 6), ("fund_min", "元起收", 6)])
+        fee_row("卖出印花税", [("stamp_rate", "万分之（仅股票卖出）", 8)])
+        tk.Label(sec, text="费用 = 佣金（成交额 × 费率，不足起收按起收）＋ 卖出印花税（仅股票）",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(2, 10))
+
     def _build_shortcuts(self, parent):
         pal = self.pal
         sec = self.section(parent, "快捷键")
@@ -836,9 +991,31 @@ class SettingsWindow(BaseDialog):
             elif not value and not actual:
                 self.autostart_hint.config(text="已关闭", fg=self.pal["faint"])
             elif value and not actual:
-                self.autostart_hint.config(text="写入失败：系统权限限制", fg=self.pal["warn"])
+                self.autostart_hint.config(text="写入失败：被安全软件拦截启动项", fg=self.pal["warn"])
+                self._autostart_help()
             else:
                 self.autostart_hint.config(text="取消失败：请检查启动项权限", fg=self.pal["warn"])
+
+    def _autostart_help(self):
+        """三种注册方式都失败时给出可操作的解决办法。"""
+        try:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "开机自启未能写入",
+                "注册表 / 启动文件夹 / 计划任务 三种方式都被系统拒绝。\n\n"
+                "通常是安全软件的「启动项防护」在拦截（如：火绒安全）。\n\n"
+                "解决办法：\n"
+                "1. 打开安全软件 → 信任区/白名单，添加本程序所在文件夹；\n"
+                "2. 或临时关闭「启动项防护」，打开本开关后再恢复；\n"
+                "3. 也可以手动把本程序的快捷方式放进「启动」文件夹。",
+                parent=self.win)
+        except Exception:
+            pass
+
+    def _set_dock(self, value):
+        self.app.set_dock(bool(value))
+        if hasattr(self, "dock_sw"):
+            self.dock_sw.set(bool(self.app.cfg.get("dock_taskbar")))
 
     def _set_interval(self, value):
         self.app.cfg["interval_seconds"] = float(value)
@@ -1184,237 +1361,496 @@ class ManageStocksWindow(BaseDialog):
 
 # ---------------- 持仓 ----------------
 class HoldingsWindow(BaseDialog):
+    """持仓设置 · 模拟盘: 记录买卖操作, 自动推导持仓/浮动/已实现盈亏。
+
+    窗口可拉伸; 两个列表各有分割把手可上下调节(带最小值), 布局记忆。
+    """
+
     key = "holdings"
+    MIN_LIST = 150          # 列表最小高度(px, 未缩放)
 
     def __init__(self, app):
-        super().__init__(app, "持仓设置", 880, 645)
-        self.header("持仓设置", "填写手数与成本价，实时统计盈亏")
+        lay = app.cfg.get("holdings_layout")
+        self._lay = lay if isinstance(lay, dict) else {}
+        super().__init__(app, "持仓设置 · 模拟盘", 880, 816)
+        self.header("持仓设置 · 模拟盘",
+                    "买入填成本价、卖出填卖价, 费用按费率规则自动估算, 历史盈亏自动累计")
         self.selected = None
-        self.holdings = dict(app.cfg.get("holdings", {}))
+        self.holdings = {c: {"trades": list(h.get("trades") or [])}
+                         for c, h in (app.cfg.get("holdings") or {}).items()
+                         if isinstance(h, dict)}
+        self._fee_dirty = False
+        self.min_list = int(self.MIN_LIST * self.S)
+        lay_top = int(self._lay.get("h_top") or 0)
+        lay_log = int(self._lay.get("h_log") or 0)
+        self.h_top = max(self.min_list, lay_top) if lay_top > 0 else int(236 * self.S)
+        self.h_log = max(self.min_list, lay_log) if lay_log > 0 else int(236 * self.S)
         self._build()
+        self._init_layout()
         self._refresh()
         self._tick()
 
+    # ---------- 构建 ----------
+    def _card(self, parent, title):
+        pal = self.pal
+        card = tk.Frame(parent, bg=pal["panel_alt"], highlightbackground=pal["border"],
+                        highlightthickness=1)
+        tk.Label(card, text=title, bg=pal["panel_alt"], fg=pal["muted"],
+                 font=self.fonts.label()).pack(anchor="w", padx=12, pady=(8, 4))
+        return card
+
     def _build(self):
         pal = self.pal
+        S = self.S
+        setup_ttk(self.win, pal, self.fonts, S)
+
         foot = tk.Frame(self.body, bg=pal["panel"])
         foot.pack(fill="x", side="bottom", padx=18, pady=(2, 12))
         self.status = tk.Label(foot, text="", bg=pal["panel"], fg=pal["muted"],
                                font=self.fonts.label())
         self.status.pack(side="left")
         CanvasButton(foot, "完成", self.close, pal, self.fonts, kind="primary",
-                     width=82, height=34, scale=self.S).pack(side="right")
+                     width=82, height=34, scale=S).pack(side="right")
 
         body = tk.Frame(self.body, bg=pal["panel"])
-        body.pack(fill="both", expand=True, padx=18, pady=(10, 4))
+        body.pack(fill="both", expand=True, padx=18, pady=(8, 4))
 
-        card = tk.Frame(body, bg=pal["panel_alt"], highlightbackground=pal["border"],
-                        highlightthickness=1)
+        # ---- 持仓明细(高度可调) ----
+        self.top_box = tk.Frame(body, bg=pal["panel"])
+        self.top_box.pack(fill="x")
+        self.top_box.pack_propagate(False)
+        card = self._card(self.top_box, "持仓明细")
         card.pack(fill="both", expand=True)
-        tk.Label(card, text="持仓明细", bg=pal["panel_alt"], fg=pal["muted"],
-                 font=self.fonts.label()).pack(anchor="w", padx=12, pady=(9, 4))
-
-        setup_ttk(self.win, pal, self.fonts, self.S)
-        cols = [("name", "名称", 168, "w"), ("code", "代码", 76, "w"),
-                ("price", "现价", 86, "e"), ("pct", "涨跌幅", 80, "e"),
-                ("lots", "手数", 58, "e"), ("cost", "成本价", 86, "e"),
-                ("day", "当日盈亏", 96, "e"), ("total", "累计盈亏", 102, "e")]
+        cols = [("name", "名称", 150, "w"), ("code", "代码", 74, "w"),
+                ("price", "现价", 84, "e"), ("lots", "持仓(手)", 72, "e"),
+                ("cost", "成本", 84, "e"), ("fl", "浮动盈亏", 98, "e"),
+                ("day", "今日盈亏", 98, "e"), ("real", "已实现", 92, "e")]
         self.tree = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
-                                 style="SB.Treeview", height=8)
+                                 style="SB.Treeview", height=4)
         for cid, label, width, anchor in cols:
             self.tree.heading(cid, text=label, anchor=anchor)
-            self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
-        self.tree.tag_configure("up", foreground=pal["pos"])
-        self.tree.tag_configure("down", foreground=pal["neg"])
-        self.tree.tag_configure("flat", foreground=pal["text"])
+            self.tree.column(cid, width=int(width * S), anchor=anchor, stretch=True)
+        for tag, col in (("up", pal["pos"]), ("down", pal["neg"]), ("flat", pal["text"])):
+            self.tree.tag_configure(tag, foreground=col)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        # 分割把手: 上下拖动改变持仓明细高度, 下方组件随之移动(有最小值)
+        SizeHandle(body, lambda dx, dy: self._drag_list("top", dy), pal, S, "ns",
+                   thick=int(7 * S), on_release=self._save_layout).pack(fill="x", pady=(3, 3))
 
-        edit = tk.Frame(body, bg=pal["panel_alt"], highlightbackground=pal["border"],
-                        highlightthickness=1)
-        edit.pack(fill="x", pady=(8, 0))
-        self.sel_label = tk.Label(edit, text="未选择股票", bg=pal["panel_alt"],
+        # ---- 交易区 ----
+        trade = tk.Frame(body, bg=pal["panel_alt"], highlightbackground=pal["border"],
+                         highlightthickness=1)
+        trade.pack(fill="x", pady=(8, 0))
+        self.trade = trade
+
+        head = tk.Frame(trade, bg=pal["panel_alt"])
+        head.pack(fill="x", padx=14, pady=(10, 2))
+        self.sel_label = tk.Label(head, text="在上方选择一只股票后交易", bg=pal["panel_alt"],
                                   fg=pal["text_dim"], font=self.fonts.label())
-        self.sel_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
-        tk.Label(edit, text="持有手数", bg=pal["panel_alt"], fg=pal["muted"],
-                 font=self.fonts.label()).grid(row=1, column=0, sticky="w", padx=(12, 6), pady=(2, 10))
-        self.lots_var = tk.StringVar()
-        self.lots_entry = make_entry(edit, pal, self.fonts, width=8, textvariable=self.lots_var,
-                                     numeric=True)
-        self.lots_entry.grid(row=1, column=1, sticky="w", ipady=4, pady=(2, 10))
-        tk.Label(edit, text="手（1手=100股）", bg=pal["panel_alt"], fg=pal["faint"],
-                 font=self.fonts.tiny()).grid(row=1, column=2, sticky="w", padx=6, pady=(2, 10))
-        tk.Label(edit, text="成本价", bg=pal["panel_alt"], fg=pal["muted"],
-                 font=self.fonts.label()).grid(row=1, column=3, sticky="e", padx=(18, 6), pady=(2, 10))
-        self.cost_var = tk.StringVar()
-        self.cost_entry = make_entry(edit, pal, self.fonts, width=9, textvariable=self.cost_var,
-                                     numeric=True)
-        self.cost_entry.grid(row=1, column=4, sticky="w", ipady=4, pady=(2, 10))
-        tk.Label(edit, text="选填，用于累计盈亏", bg=pal["panel_alt"], fg=pal["faint"],
-                 font=self.fonts.tiny()).grid(row=1, column=5, sticky="w", padx=(6, 0), pady=(2, 10))
-        btns = tk.Frame(edit, bg=pal["panel_alt"])
-        btns.grid(row=1, column=6, sticky="e", padx=12, pady=(2, 10))
-        CanvasButton(btns, "保存", self._save_one, pal, self.fonts, kind="primary",
-                     width=64, height=30, scale=self.S, bg=pal["panel_alt"]).pack(side="left")
-        CanvasButton(btns, "清除", self._clear_one, pal, self.fonts, kind="quiet",
-                     width=56, height=30, scale=self.S, bg=pal["panel_alt"]).pack(side="left", padx=(6, 0))
-        edit.columnconfigure(6, weight=1)
-        self.lots_entry.bind("<Return>", lambda e: self._save_one())
-        self.cost_entry.bind("<Return>", lambda e: self._save_one())
+        self.sel_label.pack(side="left")
+        self.hint_label = tk.Label(head, text="", bg=pal["panel_alt"], fg=pal["faint"],
+                                   font=self.fonts.tiny())
+        self.hint_label.pack(side="right")
 
+        form = tk.Frame(trade, bg=pal["panel_alt"])
+        form.pack(fill="x", padx=14, pady=(4, 2))
+        for i in range(4):
+            form.columnconfigure(i, weight=1, uniform="form")   # 四列等宽, 窗口越宽输入框越长
+
+        def field(col, label, numeric=True):
+            box = tk.Frame(form, bg=pal["panel_alt"])
+            box.grid(row=0, column=col, sticky="ew",
+                     padx=(0, 18 if col < 3 else 0))
+            tk.Label(box, text=label, bg=pal["panel_alt"], fg=pal["muted"],
+                     font=self.fonts.label()).pack(side="left", padx=(0, 10))
+            var = tk.StringVar()
+            ent = make_entry(box, pal, self.fonts, width=10, textvariable=var,
+                             numeric=numeric)
+            ent.pack(side="left", fill="x", expand=True, ipady=5)
+            return var, ent
+
+        self.price_var, self.price_entry = field(0, "价格")
+        self.lots_var, self.lots_entry = field(1, "数量(手)")
+        self.fee_var, self.fee_entry = field(2, "费用")
+        self.note_var, self.note_entry = field(3, "备注", numeric=False)
+
+        btns = tk.Frame(trade, bg=pal["panel_alt"])
+        btns.pack(fill="x", padx=14, pady=(6, 12))
+        CanvasButton(btns, "买入", lambda: self._trade("buy"), pal, self.fonts,
+                     kind="primary", width=92, height=34, scale=S,
+                     bg=pal["panel_alt"]).pack(side="left")
+        CanvasButton(btns, "卖出", lambda: self._trade("sell"), pal, self.fonts,
+                     width=92, height=34, scale=S, bg=pal["panel_alt"]).pack(side="left", padx=(12, 0))
+        CanvasButton(btns, "全部卖出", self._sell_all, pal, self.fonts, kind="quiet",
+                     width=104, height=34, scale=S, bg=pal["panel_alt"]).pack(side="left", padx=(12, 0))
+        tk.Label(btns, text="回车 = 买入", bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="right", padx=(0, 2))
+
+        for w in (self.price_entry, self.lots_entry, self.fee_entry, self.note_entry):
+            w.bind("<Return>", lambda e: self._trade("buy"))
+        for w in (self.price_entry, self.lots_entry):
+            w.bind("<KeyRelease>", lambda e: self._auto_fee())
+        self.fee_entry.bind("<Key>", lambda e: setattr(self, "_fee_dirty", True))
+
+        # ---- 成交记录(高度可调) ----
+        self.log_box = tk.Frame(body, bg=pal["panel"])
+        self.log_box.pack(fill="x", pady=(8, 0))
+        self.log_box.pack_propagate(False)
+        log = self._card(self.log_box, "成交记录")
+        log.pack(fill="both", expand=True)
+        lcols = [("time", "时间", 118, "w"), ("name", "名称", 118, "w"),
+                 ("side", "方向", 50, "c"), ("price", "价格", 78, "e"),
+                 ("lots", "数量(手)", 68, "e"), ("fee", "费用", 68, "e"),
+                 ("pnl", "本笔盈亏", 94, "e"), ("note", "备注", 130, "w")]
+        self.log_tree = ttk.Treeview(log, columns=[c[0] for c in lcols], show="headings",
+                                     style="SB.Treeview", height=5)
+        for cid, label, width, anchor in lcols:
+            self.log_tree.heading(cid, text=label, anchor=anchor)
+            self.log_tree.column(cid, width=int(width * S), anchor=anchor, stretch=True)
+        for tag, col in (("up", pal["pos"]), ("down", pal["neg"]), ("flat", pal["text"])):
+            self.log_tree.tag_configure(tag, foreground=col)
+        self.log_tree.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        CanvasButton(log, "删除所选记录", self._del_trade, pal, self.fonts, kind="quiet",
+                     width=118, height=28, scale=S,
+                     bg=pal["panel_alt"]).pack(anchor="w", padx=10, pady=(0, 8))
+        # 分割把手: 下拉变高成交记录, 下方汇总下移(有最小值)
+        SizeHandle(body, lambda dx, dy: self._drag_list("log", dy), pal, S, "ns",
+                   thick=int(7 * S), on_release=self._save_layout).pack(fill="x", pady=(3, 3))
+
+        # ---- 汇总 ----
         totals = tk.Frame(body, bg=pal["panel_alt"], highlightbackground=pal["border"],
                           highlightthickness=1)
         totals.pack(fill="x", pady=(8, 0))
+        self.totals = totals
         self.stat_vars = {}
-        for i, (key, label) in enumerate([("mv", "持仓市值"), ("day", "当日盈亏"),
-                                          ("total", "累计盈亏")]):
+        for key, label in (("buy", "累计买入"), ("sell", "累计卖出"),
+                           ("real", "已实现盈亏"), ("fl", "浮动盈亏"), ("total", "总盈亏")):
             cell = tk.Frame(totals, bg=pal["panel_alt"])
-            cell.pack(side="left", expand=True, fill="x", padx=14, pady=8)
+            cell.pack(side="left", expand=True, fill="x", padx=10, pady=7)
             tk.Label(cell, text=label, bg=pal["panel_alt"], fg=pal["muted"],
                      font=self.fonts.tiny()).pack(anchor="w")
             var = tk.Label(cell, text="--", bg=pal["panel_alt"], fg=pal["text"],
-                           font=self.fonts.num(0, True))
+                           font=self.fonts.num(-1, True))
             var.pack(anchor="w")
             self.stat_vars[key] = var
 
-        self._set_editor_state(False)
+        self._set_state(False)
+
+    # ---------- 布局(可拉伸 + 分割把手) ----------
+    def _init_layout(self):
+        S = self.S
+        if self.h_top <= 0:
+            self.h_top = int(236 * S)
+        if self.h_log <= 0:
+            self.h_log = int(236 * S)
+        lay = self._lay
+        try:
+            if lay.get("w") and lay.get("h"):
+                w = max(int(lay["w"]), int(820 * S))
+                h = max(int(lay["h"]), int(640 * S))
+                self.win.geometry(f"{w}x{h}+{self.win.winfo_x()}+{self.win.winfo_y()}")
+        except (TypeError, ValueError):
+            pass
+        self._apply_lists()
+        self.win.update_idletasks()
+        # 固定区高度用"实际被挤压的量"修正: 列表定高后若固定部件被压缩, 补足窗口高度
+        deficit = 0
+        for wdg in (getattr(self, "trade", None), getattr(self, "totals", None)):
+            if wdg is not None:
+                deficit = max(deficit, max(0, wdg.winfo_reqheight() - wdg.winfo_height()))
+        if deficit:
+            self.win.geometry(f"{self.win.winfo_width()}x{self.win.winfo_height() + deficit}")
+            self.win.update_idletasks()
+        # 固定区 = 窗口高 - 两个列表高(标题/表单/汇总/把手/边距)
+        self._fixed_px = self.win.winfo_height() - self.h_top - self.h_log
+        avail = self.win.winfo_height() - self._fixed_px
+        cur = self.h_top + self.h_log
+        if avail > 2 * self.min_list and cur > 0 and cur != avail:
+            self.h_top = int(round(avail * self.h_top / cur))
+            self.h_log = avail - self.h_top
+            self._apply_lists()
+        self.make_resizable(int(820 * S), self._fixed_px + 2 * self.min_list,
+                            on_resize=self._on_win_resize,
+                            on_release=self._save_layout)
+        self._save_layout()
+
+    def _apply_lists(self):
+        self.top_box.configure(height=self.h_top)
+        self.log_box.configure(height=self.h_log)
+
+    def _drag_list(self, which, dy):
+        if which == "top":
+            self._set_lists(self.h_top + dy, self.h_log, resize_win=True)
+        else:
+            self._set_lists(self.h_top, self.h_log + dy, resize_win=True)
+
+    def _set_lists(self, h_top, h_log, resize_win=False):
+        h_top = max(self.min_list, int(h_top))
+        h_log = max(self.min_list, int(h_log))
+        if (h_top, h_log) == (self.h_top, self.h_log):
+            return
+        self.h_top, self.h_log = h_top, h_log
+        self._apply_lists()
+        if resize_win:
+            # 窗口跟随内容变高/变矮, 下方组件随之移动;
+            # 贴近屏幕底部放不下时把窗口整体上移腾出空间
+            want = self._fixed_px + h_top + h_log
+            min_h = self._fixed_px + 2 * self.min_list
+            x, y = self.win.winfo_x(), self.win.winfo_y()
+            bottom_limit = self.app.screen.vy + self.app.screen.vh - 20
+            h = min(want, max(min_h, bottom_limit - y))
+            if h < want:
+                y = max(self.app.screen.vy + 10, bottom_limit - want)
+                h = want
+            if (h, y) != (self.win.winfo_height(), self.win.winfo_y()):
+                # 只改几何(轻量): 逐次强制重排是拖动卡顿的来源
+                self.win.geometry(f"{self.win.winfo_width()}x{h}+{x}+{y}")
+                self._request_round()
+
+    def _on_win_resize(self, w, h):
+        """窗口拉大/缩小时, 多出的高度按当前比例分给两个列表(各有最小值)。"""
+        total = h - self._fixed_px
+        if total < 2 * self.min_list:
+            total = 2 * self.min_list
+        cur = self.h_top + self.h_log
+        h_top = int(round(total * self.h_top / cur)) if cur > 0 else total // 2
+        h_top = min(max(self.min_list, h_top), total - self.min_list)
+        self.h_top, self.h_log = h_top, total - h_top
+        self._apply_lists()
+
+    def _save_layout(self):
+        try:
+            self.app.cfg["holdings_layout"] = {
+                "w": self.win.winfo_width(), "h": self.win.winfo_height(),
+                "h_top": int(self.h_top), "h_log": int(self.h_log)}
+            self.app.save_config()
+        except Exception:
+            pass
 
     def _codes(self):
-        return [c for c in self.app.pick_codes if c]
+        """自选 + 有持仓的代码(去重保序), 持仓不因移出自选而消失。"""
+        codes = [c for c in self.app.pick_codes if c]
+        for c in (self.app.cfg.get("holdings") or {}):
+            if c and c not in codes:
+                codes.append(c)
+        return codes
 
-    def _set_editor_state(self, enabled):
+    def _pos(self, code):
+        pos, _ = D.position_of(self.holdings.get(code, {}).get("trades"))
+        return pos
+
+    def _set_state(self, enabled):
         state = "normal" if enabled else "disabled"
-        for w in (self.lots_entry, self.cost_entry):
+        for w in (self.price_entry, self.lots_entry, self.fee_entry, self.note_entry):
             w.config(state=state)
         if not enabled:
-            self.sel_label.config(text="在上方选择一只股票后填写持仓")
+            self.sel_label.config(text="在上方选择一只股票后交易")
+            self.hint_label.config(text="")
 
+    # ---------- 表格 ----------
     def _row_values(self, code):
         q = self.app.quotes.get(code)
-        h = self.holdings.get(code, {})
-        lots = int(h.get("lots", 0) or 0)
-        cost = h.get("cost")
+        pos = self._pos(code)
         name = q.name if q else code
-        if q:
-            day = (q.price - q.prev_close) * lots * 100 if lots else 0.0
-            total = (q.price - float(cost)) * lots * 100 if (lots and cost) else None
-            values = (name, D.code_digits(code), D.fmt_price(q.price, q.dp),
-                      D.fmt_pct(q.pct), str(lots) if lots else "-",
-                      D.fmt_price(float(cost), q.dp) if cost else "-",
-                      D.fmt_money_signed(day) if lots else "-",
-                      D.fmt_money_signed(total) if total is not None else "-")
-            tag = "up" if q.pct > 0 else ("down" if q.pct < 0 else "flat")
+        price = D.fmt_price(q.price, q.dp) if q else "--"
+        realized = D.fmt_money_signed(pos.realized) if abs(pos.realized) > 0.004 else "-"
+        if q and pos.lots > 0:
+            shares = pos.lots * 100
+            fv = (q.price - pos.avg_cost) * shares if pos.avg_cost > 0 else None
+            day = (q.price - q.prev_close) * shares
+            ref = fv if fv is not None else day
+            tag = "up" if ref > 0 else ("down" if ref < 0 else "flat")
+            values = (name, D.code_digits(code), price, str(pos.lots),
+                      D.fmt_price(pos.avg_cost, q.dp) if pos.avg_cost > 0 else "-",
+                      D.fmt_money_signed(fv) if fv is not None else "-",
+                      D.fmt_money_signed(day), realized)
+        elif abs(pos.realized) > 0.004:
+            # 已清仓: 仍显示历史已实现盈亏
+            values = (name, D.code_digits(code), price, "0", "-", "-", "-", realized)
+            tag = "up" if pos.realized > 0 else "down"
         else:
-            values = (name, D.code_digits(code), "--", "--", str(lots) if lots else "-",
-                      D.fmt_price(float(cost)) if cost else "-", "--", "--")
+            values = (name, D.code_digits(code), price, "-", "-", "-", "-", "-")
             tag = "flat"
         return values, tag
 
     def _refresh(self):
-        tree = self.tree
         selected = self.selected
-        tree.delete(*tree.get_children())
+        self.tree.delete(*self.tree.get_children())
         for code in self._codes():
             values, tag = self._row_values(code)
-            tree.insert("", "end", iid=code, values=values, tags=(tag,))
-        if selected and tree.exists(selected):
-            tree.selection_set(selected)
+            self.tree.insert("", "end", iid=code, values=values, tags=(tag,))
+        if selected and self.tree.exists(selected):
+            self.tree.selection_set(selected)
+        self._refresh_log()
         self._update_totals()
 
     def _refresh_values(self):
-        """只更新单元格, 不重建行, 避免打断正在编辑的输入框。"""
-        tree = self.tree
+        """行情刷新只改单元格, 不重建行, 避免打断输入。"""
         codes = self._codes()
-        existing = list(tree.get_children())
-        if len(existing) != len(codes) or any(a != b for a, b in zip(existing, codes)):
+        existing = list(self.tree.get_children())
+        if existing != codes:
             self._refresh()
             return
         for code in codes:
             values, tag = self._row_values(code)
-            if tuple(str(v) for v in tree.item(code, "values")) != tuple(str(v) for v in values):
-                tree.item(code, values=values, tags=(tag,))
+            if tuple(str(v) for v in self.tree.item(code, "values")) != tuple(str(v) for v in values):
+                self.tree.item(code, values=values, tags=(tag,))
         self._update_totals()
+
+    def _refresh_log(self):
+        tree = self.log_tree
+        tree.delete(*tree.get_children())
+        rows = []
+        for code, h in self.holdings.items():
+            trades = h.get("trades") or []
+            _, recs = D.position_of(trades)
+            for i, t in enumerate(trades):
+                rows.append((str(t.get("time") or ""), code, i, t, recs[i]))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        for tstr, code, i, t, rec in rows:
+            q = self.app.quotes.get(code)
+            name = q.name if q else code
+            pnl = rec.get("pnl")
+            side = t.get("side")
+            values = (tstr, name, "买入" if side == "buy" else "卖出",
+                      D.fmt_price(float(t.get("price") or 0), q.dp if q else 2),
+                      str(int(t.get("lots") or 0)),
+                      D.fmt_money(float(t.get("fee") or 0)),
+                      D.fmt_money_signed(pnl) if pnl is not None else "-",
+                      str(t.get("note") or ""))
+            if pnl is None:
+                tag = "flat"
+            else:
+                tag = "up" if pnl > 0 else ("down" if pnl < 0 else "flat")
+            tree.insert("", "end", iid=f"{code}#{i}", values=values, tags=(tag,))
 
     def _update_totals(self):
         pal = self.pal
-        mv = day = total = 0.0
-        has_total = False
+        buy = sell = real = fl = 0.0
         for code in self._codes():
+            pos = self._pos(code)
+            buy += pos.buy_amount
+            sell += pos.sell_amount
+            real += pos.realized
             q = self.app.quotes.get(code)
-            h = self.holdings.get(code, {})
-            lots = int(h.get("lots", 0) or 0)
-            if not q or not lots:
-                continue
-            shares = lots * 100
-            mv += q.price * shares
-            day += (q.price - q.prev_close) * shares
-            if h.get("cost"):
-                total += (q.price - float(h["cost"])) * shares
-                has_total = True
-        self.stat_vars["mv"].config(text=D.fmt_money(mv))
-        self.stat_vars["day"].config(text=D.fmt_money_signed(day),
-                                     fg=D.change_color(day, pal) if day else pal["text"])
-        self.stat_vars["total"].config(
-            text=D.fmt_money_signed(total) if has_total else "--",
-            fg=(D.change_color(total, pal) if has_total else pal["muted"]))
+            if q and pos.lots > 0 and pos.avg_cost > 0:
+                fl += (q.price - pos.avg_cost) * pos.lots * 100
+        total = real + fl
+        for key, val, color in (("buy", buy, pal["text_dim"]), ("sell", sell, pal["text_dim"]),
+                                ("real", real, D.change_color(real, pal)),
+                                ("fl", fl, D.change_color(fl, pal)),
+                                ("total", total, D.change_color(total, pal))):
+            self.stat_vars[key].config(text=D.fmt_money_signed(val), fg=color)
 
+    # ---------- 交易 ----------
     def _on_select(self, _event=None):
         sel = self.tree.selection()
         if not sel:
             self.selected = None
-            self._set_editor_state(False)
+            self._set_state(False)
             return
         code = sel[0]
         self.selected = code
         q = self.app.quotes.get(code)
-        h = self.holdings.get(code, {})
+        pos = self._pos(code)
         name = q.name if q else code
-        self.sel_label.config(text=f"正在编辑：{name}  {D.code_digits(code)}")
-        self.lots_var.set(str(h.get("lots", "")) if h.get("lots") else "")
-        self.cost_var.set(("%.3f" % float(h["cost"])).rstrip("0").rstrip(".")
-                          if h.get("cost") else "")
-        self._set_editor_state(True)
+        self.sel_label.config(text=f"正在交易：{name}  {D.code_digits(code)}")
+        if not self.price_var.get().strip():
+            self.price_var.set(("%.3f" % q.price).rstrip("0").rstrip(".") if q else "")
+        if not self.lots_var.get().strip():
+            self.lots_var.set("1")
+        self.hint_label.config(
+            text=(f"现价 {D.fmt_price(q.price, q.dp)}   可卖 {pos.lots} 手   "
+                  f"{'成本 ' + D.fmt_price(pos.avg_cost, q.dp) if pos.avg_cost > 0 else ''}"))
+        self._set_state(True)
+        self._auto_fee()
 
-    def _save_one(self):
-        if not self.selected:
+    def _auto_fee(self):
+        if self._fee_dirty or not self.selected:
             return
-        lots_s = self.lots_var.get().strip()
-        cost_s = self.cost_var.get().strip()
         try:
-            lots = int(float(lots_s)) if lots_s else 0
+            price = float(self.price_var.get() or 0)
+            lots = int(float(self.lots_var.get() or 0))
         except ValueError:
-            self.status.config(text="手数请填写整数")
             return
-        if lots < 0:
-            lots = 0
-        cost = None
-        if cost_s:
-            try:
-                cost = float(cost_s)
-            except ValueError:
-                self.status.config(text="成本价格式不正确")
-                return
-            if cost <= 0:
-                cost = None
-        if lots > 0:
-            entry = {"lots": lots}
-            if cost:
-                entry["cost"] = round(cost, 4)
-            self.holdings[self.selected] = entry
-            self.status.config(text="已保存")
-        else:
-            self.holdings.pop(self.selected, None)
-            self.status.config(text="已清空该股票持仓")
-        self._commit()
+        fee = D.trade_fee(self.selected, "buy", price, lots, self.app.cfg.get("fees"))
+        self.fee_var.set(("%.2f" % fee).rstrip("0").rstrip(".") if fee else "")
 
-    def _clear_one(self):
-        if not self.selected:
+    def _read_form(self):
+        code = self.selected
+        if not code:
+            self.status.config(text="请先在持仓明细里选择一只股票")
+            return None
+        try:
+            price = float(self.price_var.get() or 0)
+            lots = int(float(self.lots_var.get() or 0))
+        except ValueError:
+            self.status.config(text="价格/数量格式不正确")
+            return None
+        if price <= 0 or lots <= 0:
+            self.status.config(text="价格与数量必须大于 0")
+            return None
+        try:
+            fee = float(self.fee_var.get() or 0)
+        except ValueError:
+            fee = D.trade_fee(code, "buy", price, lots, self.app.cfg.get("fees"))
+        return code, price, lots, max(0.0, fee), self.note_var.get().strip()[:40]
+
+    def _trade(self, side):
+        data = self._read_form()
+        if not data:
             return
-        self.holdings.pop(self.selected, None)
-        self.lots_var.set("")
-        self.cost_var.set("")
-        self.status.config(text="已清空该股票持仓")
+        code, price, lots, fee, note = data
+        pos = self._pos(code)
+        if side == "sell" and lots > pos.lots:
+            self.status.config(text=f"可卖不足: 当前持仓 {pos.lots} 手")
+            return
+        if not self._fee_dirty and side == "sell":
+            fee = D.trade_fee(code, "sell", price, lots, self.app.cfg.get("fees"))
+            self.fee_var.set("%.2f" % fee)
+        trade = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "side": side,
+                 "price": round(price, 4), "lots": lots,
+                 "fee": round(fee, 2), "note": note}
+        self.holdings.setdefault(code, {"trades": []})["trades"].append(trade)
         self._commit()
+        self.status.config(
+            text=("已买入 %d 手 @ %s, 费用 %s" if side == "buy"
+                  else "已卖出 %d 手 @ %s, 费用 %s") % (lots, D.fmt_price(price, 2),
+                                                        D.fmt_money(fee)))
+
+    def _sell_all(self):
+        if not self.selected:
+            self.status.config(text="请先选择一只股票")
+            return
+        pos = self._pos(self.selected)
+        if pos.lots <= 0:
+            self.status.config(text="当前无持仓可卖")
+            return
+        self.lots_var.set(str(pos.lots))
+        self._fee_dirty = False
+        self._trade("sell")
+
+    def _del_trade(self):
+        sel = self.log_tree.selection()
+        if not sel:
+            self.status.config(text="请先在成交记录里选择一条")
+            return
+        code, _, idx = sel[0].partition("#")
+        trades = self.holdings.get(code, {}).get("trades") or []
+        try:
+            i = int(idx)
+            removed = trades.pop(i)
+        except (ValueError, IndexError):
+            return
+        if not trades:
+            self.holdings.pop(code, None)
+        self._commit()
+        self.status.config(
+            text="已删除: %s %s %s手 @ %s" % (
+                removed.get("time", ""),
+                "买入" if removed.get("side") == "buy" else "卖出",
+                removed.get("lots"), D.fmt_price(float(removed.get("price") or 0), 2)))
 
     def _commit(self):
         self.app.cfg["holdings"] = self.holdings

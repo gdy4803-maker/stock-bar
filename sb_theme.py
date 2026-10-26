@@ -286,6 +286,57 @@ class Screen:
             pass
         return self.vx, self.vy, self.vw, self.vh
 
+    def find_free_span(self, x: int, y: int, w: int, h: int, need: int,
+                       ignore: tuple[int, int] | None = None) -> int | None:
+        """在屏幕条带上找第一个"无内容"的横向空位, 返回其起始 x; 找不到返回 None。
+
+        逐列看整条带的亮度跨度: 图标/文字任意高度都会被识别为内容,
+        只有任务栏底色的列才算空位。ignore=(x0, x1) 区段视为已有自身、跳过判定。
+        """
+        spans = screen_col_ranges(int(x), int(y), int(w), int(h))
+        if len(spans) < need + 2:
+            return None
+        free = [s <= 24 for s in spans]
+        if ignore is not None:
+            i0 = max(0, ignore[0] - int(x))
+            i1 = min(len(free), ignore[1] - int(x))
+            for i in range(i0, i1):
+                free[i] = True
+        run = 0
+        for i in range(len(free)):
+            run = 0 if not free[i] else run + 1
+            if run >= need:
+                return int(x) + (i - need + 1)
+        return None
+
+    def taskbar_band(self, x: int, y: int) -> tuple[int, int, int, int]:
+        """返回包含指定点的显示器上任务栏条带 (left, top, w, h)。
+
+        用显示器矩形与工作区之差求出任务栏位置, 支持底/顶/左/右四个方向。
+        """
+        try:
+            u = self.user32
+            u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            u.MonitorFromPoint.restype = ctypes.c_void_p
+            u.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+            hmon = u.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)
+            if hmon:
+                mi = MONITORINFO()
+                mi.cbSize = ctypes.sizeof(MONITORINFO)
+                if u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    m, w = mi.rcMonitor, mi.rcWork
+                    if w.bottom < m.bottom:        # 底部任务栏
+                        return m.left, w.bottom, m.right - m.left, m.bottom - w.bottom
+                    if w.top > m.top:              # 顶部任务栏
+                        return m.left, m.top, m.right - m.left, w.top - m.top
+                    if w.left > m.left:            # 左侧任务栏
+                        return m.left, m.top, w.left - m.left, m.bottom - m.top
+                    if w.right < m.right:          # 右侧任务栏
+                        return w.right, m.top, m.right - w.right, m.bottom - m.top
+        except Exception:
+            pass
+        return self.vx, self.vy + self.vh - 48, self.vw, 48
+
 
 def apply_dark_titlebar(win: tk.Misc, dark: bool = True) -> None:
     """Win10/11: 让对话框标题栏跟随深色主题; 失败时忽略。"""
@@ -330,6 +381,161 @@ class _BITMAPINFOHEADER(ctypes.Structure):
 class _BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", _BITMAPINFOHEADER),
                 ("bmiColors", wintypes.DWORD * 1)]
+
+
+def screen_strip(x: int, y: int, w: int, h: int = 2):
+    """BitBlt 屏幕条带并返回逐列平均色列表 [(r,g,b), ...], 长度 = w。"""
+    if w <= 0 or h <= 0:
+        return []
+    try:
+        user32 = ctypes.windll.user32
+        gdi = ctypes.windll.gdi32
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi.SelectObject.restype = ctypes.c_void_p
+        gdi.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.BitBlt.restype = ctypes.c_bool
+        gdi.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_uint]
+        gdi.GetDIBits.restype = ctypes.c_int
+        gdi.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                  ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+
+        w, h = int(w), int(h)
+        hdc = user32.GetDC(None)
+        if not hdc:
+            return []
+        mdc = gdi.CreateCompatibleDC(hdc)
+        bmp = gdi.CreateCompatibleBitmap(hdc, w, h)
+        if not mdc or not bmp:
+            if bmp:
+                gdi.DeleteObject(ctypes.c_void_p(bmp))
+            if mdc:
+                gdi.DeleteDC(ctypes.c_void_p(mdc))
+            user32.ReleaseDC(None, ctypes.c_void_p(hdc))
+            return []
+        old = gdi.SelectObject(ctypes.c_void_p(mdc), ctypes.c_void_p(bmp))
+        gdi.BitBlt(ctypes.c_void_p(mdc), 0, 0, w, h,
+                   ctypes.c_void_p(hdc), int(x), int(y), 0x00CC0020)
+        bi = _BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bi.biWidth = w
+        bi.biHeight = -h
+        bi.biPlanes = 1
+        bi.biBitCount = 32
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader = bi
+        buf = (ctypes.c_ubyte * (w * h * 4))()
+        ok = gdi.GetDIBits(ctypes.c_void_p(mdc), ctypes.c_void_p(bmp),
+                           0, h, ctypes.byref(buf), ctypes.byref(bmi), 0)
+        if old:
+            gdi.SelectObject(ctypes.c_void_p(mdc), ctypes.c_void_p(old))
+        gdi.DeleteObject(ctypes.c_void_p(bmp))
+        gdi.DeleteDC(ctypes.c_void_p(mdc))
+        user32.ReleaseDC(None, ctypes.c_void_p(hdc))
+        if not ok:
+            return []
+        cols = []
+        for xi in range(w):
+            rs = gs = bs = 0
+            for yi in range(h):
+                j = (yi * w + xi) * 4
+                bs += buf[j]
+                gs += buf[j + 1]
+                rs += buf[j + 2]
+            cols.append((rs // h, gs // h, bs // h))
+        return cols
+    except Exception:
+        return []
+
+
+def screen_col_ranges(x: int, y: int, w: int, h: int):
+    """BitBlt 屏幕矩形, 返回每列"偏离背景"的程度(越大越可能有内容)。
+
+    判据: 该列像素亮度相对其中位数的最大偏差(取第 3 大以忽略条带边缘的干扰行)。
+    图标/文字的偏差大, 纯底色(允许渐变)偏差小。用于在任务栏里找空位。
+    """
+    if w <= 0 or h <= 0:
+        return []
+    try:
+        user32 = ctypes.windll.user32
+        gdi = ctypes.windll.gdi32
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi.SelectObject.restype = ctypes.c_void_p
+        gdi.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.BitBlt.restype = ctypes.c_bool
+        gdi.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_uint]
+        gdi.GetDIBits.restype = ctypes.c_int
+        gdi.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                  ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+
+        w, h = int(w), int(h)
+        hdc = user32.GetDC(None)
+        if not hdc:
+            return []
+        mdc = gdi.CreateCompatibleDC(hdc)
+        bmp = gdi.CreateCompatibleBitmap(hdc, w, h)
+        if not mdc or not bmp:
+            if bmp:
+                gdi.DeleteObject(ctypes.c_void_p(bmp))
+            if mdc:
+                gdi.DeleteDC(ctypes.c_void_p(mdc))
+            user32.ReleaseDC(None, ctypes.c_void_p(hdc))
+            return []
+        old = gdi.SelectObject(ctypes.c_void_p(mdc), ctypes.c_void_p(bmp))
+        gdi.BitBlt(ctypes.c_void_p(mdc), 0, 0, w, h,
+                   ctypes.c_void_p(hdc), int(x), int(y), 0x00CC0020)
+        bi = _BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bi.biWidth = w
+        bi.biHeight = -h
+        bi.biPlanes = 1
+        bi.biBitCount = 32
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader = bi
+        buf = (ctypes.c_ubyte * (w * h * 4))()
+        ok = gdi.GetDIBits(ctypes.c_void_p(mdc), ctypes.c_void_p(bmp),
+                           0, h, ctypes.byref(buf), ctypes.byref(bmi), 0)
+        if old:
+            gdi.SelectObject(ctypes.c_void_p(mdc), ctypes.c_void_p(old))
+        gdi.DeleteObject(ctypes.c_void_p(bmp))
+        gdi.DeleteDC(ctypes.c_void_p(mdc))
+        user32.ReleaseDC(None, ctypes.c_void_p(hdc))
+        if not ok:
+            return []
+        out = []
+        for xi in range(w):
+            lums = []
+            for yi in range(h):
+                j = (yi * w + xi) * 4
+                lums.append((buf[j + 2] * 299 + buf[j + 1] * 587 + buf[j] * 114) // 1000)
+            lums.sort()
+            med = lums[len(lums) // 2]
+            devs = [v - med if v > med else med - v for v in lums]
+            devs.sort()
+            # 取第 3 大偏差: 忽略条带上下边缘等个别干扰行
+            out.append(devs[-3] if len(devs) >= 3 else devs[-1])
+        return out
+    except Exception:
+        return []
 
 
 def sample_screen_rect(x: int, y: int, w: int, h: int):

@@ -12,6 +12,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 QUOTE_URL = "https://qt.gtimg.cn/q={codes}"
+SINA_URL = "https://hq.sinajs.cn/list={codes}"
 MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}&_var=min_data"
 SEARCH_URL = "https://smartbox.gtimg.cn/s3/?q={kw}&t=all"
 
@@ -21,6 +22,8 @@ HEADERS = {
     "Referer": "https://gu.qq.com/",
     "Accept": "*/*",
 }
+# 新浪行情必须带财经站 Referer, 否则 403
+SINA_HEADERS = dict(HEADERS, Referer="https://finance.sina.com.cn")
 
 MARKETS = ("sh", "sz", "bj", "hk", "us")
 
@@ -128,6 +131,107 @@ def _to_float(value: str, default: float = 0.0) -> float:
         return default
 
 
+def _round2(v: float) -> float:
+    return round(v + 0.0, 2)
+
+
+# ---------------- 模拟盘: 交易费用与持仓推导 ----------------
+DEFAULT_FEES = {
+    "stock_rate": 0.00009,   # 股票佣金费率: 万0.9
+    "stock_min": 5.0,        # 股票佣金起收(元)
+    "fund_rate": 0.00006,    # ETF/场内基金佣金: 万0.6
+    "fund_min": 0.1,         # ETF 起收(元)
+    "stamp_rate": 0.0005,    # 卖出印花税: 万5(仅股票)
+}
+
+
+def is_fund(code: str) -> bool:
+    """ETF / LOF 等场内基金(按代码段判断)。"""
+    c = code[2:] if len(code) > 2 else code
+    return c.startswith(("51", "56", "58", "159", "16"))
+
+
+def trade_fee(code: str, side: str, price: float, lots: int, fees=None) -> float:
+    """估算交易费用(元) = 佣金(按品种费率/起收) + 卖出印花税(仅股票)。
+
+    fees 可覆盖默认费率: stock_rate/stock_min/fund_rate/fund_min/stamp_rate。
+    """
+    f = dict(DEFAULT_FEES)
+    if isinstance(fees, dict):
+        for k in DEFAULT_FEES:
+            try:
+                if k in fees:
+                    f[k] = float(fees[k])
+            except (TypeError, ValueError):
+                pass
+    try:
+        amount = float(price) * int(lots) * 100.0
+    except (TypeError, ValueError):
+        return 0.0
+    if amount <= 0:
+        return 0.0
+    if is_fund(code):
+        fee = max(amount * f["fund_rate"], f["fund_min"])
+    else:
+        fee = max(amount * f["stock_rate"], f["stock_min"])
+        if side == "sell":
+            fee += amount * f["stamp_rate"]
+    return round(fee, 2)
+
+
+@dataclass(slots=True)
+class Position:
+    lots: int = 0            # 当前持仓(手)
+    avg_cost: float = 0.0    # 平均成本(元), 0 表示成本未知
+    realized: float = 0.0    # 已实现盈亏(元, 历史累计)
+    buy_amount: float = 0.0  # 累计买入金额
+    sell_amount: float = 0.0 # 累计卖出金额
+    fees: float = 0.0        # 累计费用
+
+
+def position_of(trades):
+    """平均成本法推导持仓, 返回 (Position, rows)。
+
+    买入: 费用计入成本; 卖出: 按当时均价结算已实现盈亏, 均价不变。
+    rows 与 trades 等长, 每项 {"lots_after","avg_after","pnl"}。
+    """
+    pos = Position()
+    rows = []
+    for t in trades or []:
+        rec = {"lots_after": pos.lots, "avg_after": pos.avg_cost, "pnl": None}
+        if isinstance(t, dict):
+            side = t.get("side")
+            try:
+                price = float(t.get("price") or 0)
+                lots = int(t.get("lots") or 0)
+                fee = float(t.get("fee") or 0)
+            except (TypeError, ValueError):
+                price, lots, fee = 0.0, 0, 0.0
+            if lots > 0 and side == "buy":
+                prev_shares = pos.lots * 100
+                pos.lots += lots
+                pos.fees += fee
+                if price > 0:
+                    pos.buy_amount += price * lots * 100.0
+                    new_shares = pos.lots * 100
+                    pos.avg_cost = ((prev_shares * pos.avg_cost
+                                     + price * lots * 100.0 + fee) / new_shares
+                                    if new_shares else 0.0)
+            elif lots > 0 and side == "sell":
+                sell_lots = min(lots, pos.lots)
+                if sell_lots > 0:
+                    pos.sell_amount += price * sell_lots * 100.0
+                    pos.fees += fee
+                    rec["pnl"] = ((price - pos.avg_cost) * sell_lots * 100.0 - fee
+                                  if pos.avg_cost > 0 else 0.0)
+                    pos.realized += rec["pnl"]
+                    pos.lots -= sell_lots
+        rec["lots_after"] = pos.lots
+        rec["avg_after"] = pos.avg_cost
+        rows.append(rec)
+    return pos, rows
+
+
 def _price_dp(raw: str) -> int:
     raw = (raw or "").strip()
     if "." in raw:
@@ -135,12 +239,8 @@ def _price_dp(raw: str) -> int:
     return 2
 
 
-def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote]:
-    """批量拉取实时行情, 返回 {code: Quote}。网络/解析异常会向上抛出。"""
-    codes = [c for c in codes if c]
-    if not codes:
-        return {}
-    index_set = set(index_codes or ())
+def _fetch_tencent(codes, index_set, timeout: float) -> dict[str, Quote]:
+    """腾讯行情(主源): 批量、稳定, 更新节奏约 1~3s。"""
     url = QUOTE_URL.format(codes=",".join(codes))
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -181,6 +281,96 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
         except (IndexError, ValueError):
             continue
     return result
+
+
+def _fetch_sina(codes, index_set, timeout: float) -> dict[str, Quote]:
+    """新浪行情(副源): A股全覆盖, 与腾讯互有先后 —— 合并后能比任一单源更快看到新价。
+
+    字段: 0名称 1今开 2昨收 3最新 4最高 5最低 ... 8成交量(股) 9成交额(元) 30日期 31时间
+    """
+    codes = [c for c in codes if c[:2] in ("sh", "sz", "bj")]
+    if not codes:
+        return {}
+    url = SINA_URL.format(codes=",".join(codes))
+    req = urllib.request.Request(url, headers=SINA_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("gbk", errors="replace")
+
+    result: dict[str, Quote] = {}
+    for line in text.strip().splitlines():
+        line = line.strip().rstrip(";")
+        if not line or "=" not in line:
+            continue
+        var, _, payload = line.partition("=")
+        code = var.strip()
+        if code.startswith("var "):
+            code = code[4:].strip()
+        if code.startswith("hq_str_"):
+            code = code[len("hq_str_"):]
+        f = payload.strip().strip('"').split(",")
+        if len(f) < 32 or not f[0]:
+            continue
+        try:
+            price_raw = f[3] or "0"
+            stamp = (f[30].replace("-", "") + f[31].replace(":", ""))[:14]
+            result[code] = Quote(
+                code=code,
+                name=f[0],
+                price=_to_float(f[3]),
+                prev_close=_to_float(f[2]),
+                open=_to_float(f[1]),
+                high=_to_float(f[4]),
+                low=_to_float(f[5]),
+                change=_round2(_to_float(f[3]) - _to_float(f[2])),
+                pct=_round2((_to_float(f[3]) / _to_float(f[2]) - 1) * 100 if _to_float(f[2]) else 0.0),
+                volume=_to_float(f[8]) / 100.0,        # 股 -> 手(对齐腾讯)
+                amount=_to_float(f[9]) / 10000.0,      # 元 -> 万元(对齐腾讯)
+                time=stamp,
+                dp=_price_dp(price_raw),
+                is_index=code in index_set,
+            )
+        except (IndexError, ValueError, ZeroDivisionError):
+            continue
+    return result
+
+
+def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote]:
+    """批量拉取实时行情, 返回 {code: Quote}。网络/解析异常会向上抛出。
+
+    腾讯 + 新浪双源并发, 按行情时间戳取更新的那条 ——
+    交易所 L1 快照约 3s 一拍, 两源刷新相位不同, 合并后比任一单源更快看到新价。
+    """
+    codes = [c for c in codes if c]
+    if not codes:
+        return {}
+    index_set = set(index_codes or ())
+
+    from concurrent.futures import ThreadPoolExecutor
+    tencent: dict[str, Quote] = {}
+    sina: dict[str, Quote] = {}
+    errors: list[Exception] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_qq = pool.submit(_fetch_tencent, codes, index_set, timeout)
+        f_sn = pool.submit(_fetch_sina, codes, index_set, timeout)
+        for fut, name in ((f_qq, "腾讯"), (f_sn, "新浪")):
+            try:
+                data = fut.result()
+                if fut is f_qq:
+                    tencent = data
+                else:
+                    sina = data
+            except Exception as exc:      # 单源失败不影响另一源
+                errors.append(exc if isinstance(exc, Exception) else RuntimeError(name))
+    if not tencent and not sina:
+        raise errors[0] if errors else RuntimeError("行情源无数据")
+
+    merged = dict(tencent)
+    for code, q in sina.items():
+        cur = merged.get(code)
+        # 时间戳(YYYYMMDDHHMMSS)字典序即时间序; 相同则保留腾讯
+        if cur is None or str(q.time) > str(cur.time):
+            merged[code] = q
+    return merged
 
 
 # ---------------- 分时 ----------------
