@@ -12,8 +12,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import sb_data as D
-from sb_theme import (KEY_COLOR, center_on_bar, draw_round_rect,
-                      focus_window, force_topmost)
+from sb_theme import (KEY_COLOR, apply_dark_titlebar, center_on_bar,
+                      draw_round_rect, focus_window, force_topmost)
 from sb_widgets import (CanvasButton, Segmented, SizeHandle, Slider, Switch,
                         make_entry, setup_ttk)
 
@@ -78,6 +78,21 @@ class InfoCard:
         self.w = 0
         self.h = 0
 
+    def _card_alpha(self) -> float:
+        """卡片透明度(10% ~ 100%), 可在设置里调节。"""
+        try:
+            v = float(self.app.cfg.get("card_opacity", 1.0))
+        except (TypeError, ValueError):
+            v = 1.0
+        return max(0.10, min(1.0, v))
+
+    def apply_alpha(self):
+        """应用卡片透明度(设置里拖动滑杆时即时生效)。"""
+        try:
+            self.win.attributes("-alpha", self._card_alpha())
+        except tk.TclError:
+            pass
+
     # ---------- 显示/隐藏 ----------
     def show(self, code):
         if not code or code not in self.app.quotes:
@@ -91,6 +106,7 @@ class InfoCard:
         self.visible = True
         self._render()
         self._place()
+        self.apply_alpha()
         self.win.deiconify()
         force_topmost(self.win)
         self.win.lift()
@@ -118,6 +134,7 @@ class InfoCard:
         if self.visible:
             self._render()
             self._place()
+            self.apply_alpha()
 
     # ---------- 布局 ----------
     def _holding(self, q):
@@ -376,34 +393,42 @@ class InfoCard:
 class BaseDialog:
     key = ""
 
-    def __init__(self, app, title, width, height):
+    def __init__(self, app, title, width, height, min_size=(620, 460)):
         self.app = app
         self.pal = app.pal
         self.fonts = app.ui_fonts
         self.S = app.scale
         self.title_text = title
-        self._move_origin = None
+        self._on_resize_cb = None
+        self._on_resize_release_cb = None
+        self._resize_job = None
+        self._last_size = None
         self.win = tk.Toplevel(app.root)
         self.win.withdraw()
         self.win.title(title)
-        self.win.overrideredirect(True)
-        self.win.configure(bg=self.pal["border"])
+        self.win.configure(bg=self.pal["panel"])
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
         w, h = int(width * self.S), int(height * self.S)
         bx, by, bw, bh = app.bar_rect()
         center_on_bar(self.win, bx, by, bw, bh, w, h, app.screen)
         self.win.bind("<Escape>", lambda e: self.close())
+        # 正宗 Windows 窗口: 系统标题栏 + 原生 8 向缩放(拖动/贴边/动画由系统提供)
+        self.win.resizable(True, True)
+        try:
+            self.win.wm_minsize(int(min_size[0] * self.S), int(min_size[1] * self.S))
+        except tk.TclError:
+            pass
+        self.win.bind("<Configure>", self._on_configure)
 
         self.shell = tk.Frame(self.win, bg=self.pal["panel"])
         self.shell.pack(fill="both", expand=True, padx=1, pady=1)
-        self._build_titlebar()
         self.body = tk.Frame(self.shell, bg=self.pal["panel"])
         self.body.pack(fill="both", expand=True)
 
         self.win.deiconify()
         self.win.update_idletasks()
-        self._round_corners()
+        apply_dark_titlebar(self.win, self.pal.get("name") == "dark")
         force_topmost(self.win)
         self.win.lift()
         self.win.focus_force()
@@ -411,149 +436,38 @@ class BaseDialog:
         if self.key:
             app._dialogs[self.key] = self
 
-    def _round_corners(self):
-        try:
-            w = self.win.winfo_width()
-            h = self.win.winfo_height()
-            r = int(14 * self.S)
-            gdi = ctypes.windll.gdi32
-            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
-            gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_int, ctypes.c_int]
-            rgn = gdi.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
-            user32 = ctypes.windll.user32
-            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            user32.GetAncestor.restype = ctypes.c_void_p
-            hwnd = user32.GetAncestor(self.win.winfo_id(), 2) or self.win.winfo_id()
-            user32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
-            user32.SetWindowRgn(ctypes.c_void_p(hwnd), ctypes.c_void_p(rgn), True)
-        except Exception:
-            pass
-
-    # ---- 窗口拉伸(与普通窗口一致: 4 边 + 4 角, 8 个方向) ----
-    def make_resizable(self, min_w, min_h, on_resize=None, on_release=None):
-        """开放 8 个方向拖拽改变窗口大小(带最小尺寸/屏幕边界限制)。"""
-        self._min_w = int(min_w)
-        self._min_h = int(min_h)
+    # ---- 窗口缩放: 由系统原生边框处理, 这里只做回调分发 ----
+    def set_resize_handler(self, on_resize=None, on_release=None):
+        """注册窗口尺寸变化回调: on_resize(w, h) 在缩放过程中触发(防抖),
+        on_release() 在缩放结束后触发(适合保存布局)。"""
         self._on_resize_cb = on_resize
         self._on_resize_release_cb = on_release
-        self._round_at = 0.0
-        S = self.S
-        edge = max(5, int(6 * S))          # 边命中宽度
-        corner = max(12, int(16 * S))      # 角命中宽度
-        zones = (
-            ("n", "ns", dict(relx=0.5, rely=0.0, anchor="n", relwidth=1.0, height=edge)),
-            ("s", "ns", dict(relx=0.5, rely=1.0, anchor="s", relwidth=1.0, height=edge)),
-            ("w", "ew", dict(relx=0.0, rely=0.5, anchor="w", relheight=1.0, width=edge)),
-            ("e", "ew", dict(relx=1.0, rely=0.5, anchor="e", relheight=1.0, width=edge)),
-            ("nw", "nwse", dict(relx=0.0, rely=0.0, anchor="nw", width=corner, height=corner)),
-            ("ne", "nesw", dict(relx=1.0, rely=0.0, anchor="ne", width=corner, height=corner)),
-            ("sw", "nesw", dict(relx=0.0, rely=1.0, anchor="sw", width=corner, height=corner)),
-            ("se", "nwse", dict(relx=1.0, rely=1.0, anchor="se", width=corner, height=corner)),
-        )
-        for zone, orient, geo in zones:
-            h = SizeHandle(self.win,
-                           lambda dx, dy, z=zone: self._resize(dx, dy, z),
-                           self.pal, S, orient, thick=edge if orient in ("ns", "ew") else corner,
-                           on_release=self._resize_done)
-            h.place(**geo)
 
-    def _resize(self, dx, dy, zone):
-        x, y = self.win.winfo_x(), self.win.winfo_y()
-        w, h = self.win.winfo_width(), self.win.winfo_height()
-        if "e" in zone:
-            w += dx
-        if "s" in zone:
-            h += dy
-        if "w" in zone:
-            w -= dx
-            x += dx
-        if "n" in zone:
-            h -= dy
-            y += dy
-        # 最小尺寸: 夹住拖动边, 对边保持不动
-        if w < self._min_w:
-            if "w" in zone:
-                x -= self._min_w - w
-            w = self._min_w
-        if h < self._min_h:
-            if "n" in zone:
-                y -= self._min_h - h
-            h = self._min_h
-        # 屏幕边界: 不移出可视区, 也不撑出屏幕
-        scr = self.app.screen
-        x = max(scr.vx + 4, min(x, scr.vx + scr.vw - w - 4))
-        y = max(scr.vy + 4, min(y, scr.vy + scr.vh - h - 4))
-        if (w, h, x, y) == (self.win.winfo_width(), self.win.winfo_height(),
-                            self.win.winfo_x(), self.win.winfo_y()):
+    def _on_configure(self, event):
+        if event.widget is not self.win:
             return
-        # 只改几何(轻量), 强制同步重排是卡顿来源
-        self.win.geometry(f"{w}x{h}+{x}+{y}")
-        # 圆角延后补画: 紧跟 geometry 的 SetWindowRgn 会把未生效的移动冲掉
-        self._request_round()
-        if self._on_resize_cb:
-            self._on_resize_cb(w, h)
+        if self._resize_job is not None:
+            try:
+                self.win.after_cancel(self._resize_job)
+            except tk.TclError:
+                pass
+        try:
+            self._resize_job = self.win.after(120, self._fire_resize)
+        except tk.TclError:
+            self._resize_job = None
 
-    def _request_round(self):
-        """延后补画圆角(合并到下一拍, 拖动中不逐次重绘)。"""
-        if getattr(self, "_round_pending", False):
+    def _fire_resize(self):
+        self._resize_job = None
+        try:
+            w, h = self.win.winfo_width(), self.win.winfo_height()
+        except tk.TclError:
             return
-        self._round_pending = True
-        try:
-            self.win.after(30, self._round_later)
-        except tk.TclError:
-            self._round_pending = False
-
-    def _round_later(self):
-        self._round_pending = False
-        try:
-            if self.win.winfo_exists():
-                self._round_corners()
-        except tk.TclError:
-            pass
-
-    def _resize_done(self):
-        self.win.update_idletasks()
-        self._round_corners()
-        if self._on_resize_cb:
-            self._on_resize_cb(self.win.winfo_width(), self.win.winfo_height())
+        if (w, h) != self._last_size:
+            self._last_size = (w, h)
+            if self._on_resize_cb:
+                self._on_resize_cb(w, h)
         if self._on_resize_release_cb:
             self._on_resize_release_cb()
-
-    def _build_titlebar(self):
-        pal, F, S = self.pal, self.fonts, self.S
-        tb = tk.Frame(self.shell, bg=pal["panel_alt"], height=int(38 * S))
-        tb.pack(fill="x")
-        tb.pack_propagate(False)
-        self.titlebar = tb
-        dot = tk.Label(tb, text="●", bg=pal["panel_alt"], fg=pal["accent"],
-                       font=F.ui(-4))
-        dot.pack(side="left", padx=(14, 6))
-        label = tk.Label(tb, text=self.title_text, bg=pal["panel_alt"], fg=pal["text_dim"],
-                         font=F.ui(-2, True))
-        label.pack(side="left")
-        close = tk.Label(tb, text="✕", bg=pal["panel_alt"], fg=pal["faint"],
-                         font=F.ui(0), width=3, cursor="hand2")
-        close.pack(side="right", fill="y")
-        close.bind("<Enter>", lambda e: close.config(bg=pal["pos_soft"], fg=pal["pos"]))
-        close.bind("<Leave>", lambda e: close.config(bg=pal["panel_alt"], fg=pal["faint"]))
-        close.bind("<Button-1>", lambda e: self.close())
-        for w in (tb, dot, label):
-            w.bind("<Button-1>", self._tb_press)
-            w.bind("<B1-Motion>", self._tb_drag)
-        tk.Frame(self.shell, bg=pal["border"], height=1).pack(fill="x")
-
-    def _tb_press(self, event):
-        self._move_origin = (event.x_root, event.y_root, self.win.winfo_x(), self.win.winfo_y())
-
-    def _tb_drag(self, event):
-        if not self._move_origin:
-            return
-        dx = event.x_root - self._move_origin[0]
-        dy = event.y_root - self._move_origin[1]
-        x = self._move_origin[2] + dx
-        y = self._move_origin[3] + dy
-        x, y = self.app.screen.clamp(x, y, self.win.winfo_width(), self.win.winfo_height(), 4)
-        self.win.geometry(f"+{x}+{y}")
 
     def raise_(self):
         try:
@@ -575,35 +489,43 @@ class BaseDialog:
 
     # ---- 通用部件 ----
     def header(self, title, subtitle):
+        """副标题行(标题已由系统标题栏展示, 不再重复)。"""
         head = tk.Frame(self.body, bg=self.pal["panel"])
-        head.pack(fill="x", padx=22, pady=(16, 10))
-        tk.Label(head, text=title, bg=self.pal["panel"], fg=self.pal["text"],
-                 font=self.fonts.dialog_title(), anchor="w").pack(side="left")
+        head.pack(fill="x", padx=22, pady=(14, 8))
         tk.Label(head, text=subtitle, bg=self.pal["panel"], fg=self.pal["muted"],
-                 font=self.fonts.label(), anchor="w").pack(side="left", padx=(12, 0), pady=(6, 0))
+                 font=self.fonts.label(), anchor="w").pack(side="left")
         ver = tk.Label(head, text="v" + self.app.version, bg=self.pal["panel"],
                        fg=self.pal["faint"], font=self.fonts.tiny())
         ver.pack(side="right", pady=(6, 0))
         tk.Frame(self.body, bg=self.pal["border"], height=1).pack(fill="x")
 
     def section(self, parent, title):
-        outer = tk.Frame(parent, bg=self.pal["panel_alt"],
-                         highlightbackground=self.pal["border"], highlightthickness=1)
-        outer.pack(fill="x", pady=(0, 10))
-        tk.Label(outer, text=title, bg=self.pal["panel_alt"], fg=self.pal["muted"],
-                 font=self.fonts.label(), anchor="w").pack(fill="x", padx=14, pady=(9, 2))
-        inner = tk.Frame(outer, bg=self.pal["panel_alt"])
-        inner.pack(fill="x", padx=14, pady=(0, 10))
+        pal, S = self.pal, self.S
+        outer = tk.Frame(parent, bg=pal["panel_alt"],
+                         highlightbackground=pal["border"], highlightthickness=1)
+        outer.pack(fill="x", pady=(0, 12))
+        head = tk.Frame(outer, bg=pal["panel_alt"])
+        head.pack(fill="x", padx=14, pady=(10, 4))
+        bar = tk.Frame(head, bg=pal["accent"], width=max(2, int(3 * S)),
+                       height=int(13 * S))
+        bar.pack(side="left", padx=(0, 8))
+        bar.pack_propagate(False)
+        tk.Label(head, text=title, bg=pal["panel_alt"], fg=pal["text_dim"],
+                 font=self.fonts.label(), anchor="w").pack(side="left")
+        inner = tk.Frame(outer, bg=pal["panel_alt"])
+        inner.pack(fill="x", padx=14, pady=(0, 12))
         return inner
 
-    def row(self, parent, label, label_width=84):
-        r = tk.Frame(parent, bg=self.pal["panel_alt"])
-        r.pack(fill="x", pady=3)
-        holder = tk.Frame(r, bg=self.pal["panel_alt"], width=int(label_width * self.S))
+    def row(self, parent, label, label_width=92):
+        """一行设置项: 左侧固定宽标签 + 右侧控件(垂直居中)。"""
+        pal = self.pal
+        r = tk.Frame(parent, bg=pal["panel_alt"])
+        r.pack(fill="x", pady=4)
+        holder = tk.Frame(r, bg=pal["panel_alt"], width=int(label_width * self.S))
         holder.pack(side="left", fill="y")
         holder.pack_propagate(False)
-        tk.Label(holder, text=label, bg=self.pal["panel_alt"], fg=self.pal["text_dim"],
-                 font=self.fonts.label(), anchor="w").pack(side="left", pady=5)
+        tk.Label(holder, text=label, bg=pal["panel_alt"], fg=pal["text_dim"],
+                 font=self.fonts.label(), anchor="w").pack(side="left", pady=6)
         return r
 
 
@@ -705,33 +627,36 @@ class SettingsWindow(BaseDialog):
         r = self.row(sec, "字号")
         Segmented(r, [(10, "10"), (12, "12"), (14, "14"), (16, "16")],
                   int(self.app.cfg["font_size"]), self._set_font, pal, self.fonts,
-                  min_item=40).pack(side="left")
+                  min_item=44).pack(side="left")
+        r = self.row(sec, "显示名称")
         self.show_name_sw = Switch(r, bool(self.app.cfg["show_name"]),
                                    self._set_show_name, pal, S)
-        self.show_name_sw.pack(side="right", padx=(0, 2))
-        tk.Label(r, text="显示名称", bg=pal["panel_alt"], fg=pal["text_dim"],
-                 font=self.fonts.label()).pack(side="right", padx=(0, 8))
+        self.show_name_sw.pack(side="left", pady=2)
+        tk.Label(r, text="行情条里显示股票名称", bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "文字不透明度")
         Slider(r, int(round(float(self.app.cfg["opacity"]) * 100)), 10, 100,
-               self._set_opacity, pal, self.fonts, scale=S, width=236).pack(side="left", pady=2)
+               self._set_opacity, pal, self.fonts, scale=S, width=264).pack(side="left", pady=2)
         r = self.row(sec, "背景不透明度")
         Slider(r, int(round(float(self.app.cfg.get("bg_opacity", 1.0)) * 100)), 0, 100,
-               self._set_bg_opacity, pal, self.fonts, scale=S, width=236).pack(side="left", pady=2)
+               self._set_bg_opacity, pal, self.fonts, scale=S, width=264).pack(side="left", pady=2)
+        r = self.row(sec, "卡片透明度")
+        Slider(r, int(round(float(self.app.cfg.get("card_opacity", 1.0)) * 100)), 10, 100,
+               self._set_card_opacity, pal, self.fonts, scale=S, width=264).pack(side="left", pady=2)
 
     def _build_window(self, parent):
         pal = self.pal
         sec = self.section(parent, "窗口")
         r = self.row(sec, "窗口置顶")
         Switch(r, bool(self.app.cfg["topmost"]), self._set_topmost, pal, self.S).pack(side="left", pady=2)
-        tk.Label(r, text="让行情条始终浮在其他窗口之上", bg=pal["panel_alt"],
+        tk.Label(r, text="行情条始终浮在其他窗口之上", bg=pal["panel_alt"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "嵌入任务栏")
         self.dock_sw = Switch(r, bool(self.app.cfg.get("dock_taskbar")), self._set_dock,
                               pal, self.S)
         self.dock_sw.pack(side="left", pady=2)
-        tk.Label(r, text="像天气组件一样长在任务栏上（自动找空位、无底色、可左右拖）",
-                 bg=pal["panel_alt"], fg=pal["faint"],
-                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
+        tk.Label(r, text="长在任务栏上，可左右拖动", bg=pal["panel_alt"],
+                 fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "开机启动")
         self.autostart_sw = Switch(r, bool(self.app.is_autostart()), self._set_autostart,
                                    pal, self.S)
@@ -814,9 +739,28 @@ class SettingsWindow(BaseDialog):
                      bg=pal["panel_alt"]).pack(side="right")
 
     def _open_repo(self):
-        import webbrowser
         url = getattr(self.app, "repo_url", "") or "https://github.com/gdy4803-maker/stock-bar"
-        webbrowser.open(url)
+        # 打包成 exe 后 webbrowser 模块常失效, 优先用系统 ShellExecute 打开默认浏览器
+        opened = False
+        try:
+            os.startfile(url)          # type: ignore[attr-defined]
+            opened = True
+        except Exception:
+            try:
+                import webbrowser
+                opened = bool(webbrowser.open(url))
+            except Exception:
+                opened = False
+        if not opened:
+            try:
+                self.app.input.clipboard_clear()
+                self.app.input.clipboard_append(url)
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "打开仓库",
+                "无法自动打开浏览器，链接已复制到剪贴板：\n\n" + url,
+                parent=self.win)
 
     # ---- 行情 ----
     def _build_market(self, parent):
@@ -896,21 +840,20 @@ class SettingsWindow(BaseDialog):
         fee_row("股票佣金", [("stock_rate", "万分之", 6), ("stock_min", "元起收", 6)])
         fee_row("ETF 佣金", [("fund_rate", "万分之", 6), ("fund_min", "元起收", 6)])
         fee_row("卖出印花税", [("stamp_rate", "万分之（仅股票卖出）", 8)])
-        tk.Label(sec, text="费用 = 佣金（成交额 × 费率，不足起收按起收）＋ 卖出印花税（仅股票）",
+        tk.Label(sec, text="费用 = 佣金（不足起收按起收）＋ 卖出印花税（仅股票）",
                  bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(2, 10))
 
     def _build_shortcuts(self, parent):
         pal = self.pal
         sec = self.section(parent, "快捷键")
-        items = [("悬停", "查看详情与分时"), ("左键", "切换下一只自选"),
+        items = [("悬停", "查看分时与持仓详情"), ("左键", "切换下一只自选"),
                  ("→ / ←", "切换自选"), ("右键", "打开菜单"),
-                 ("Ctrl + ,", "设置"), ("F5", "重新加载配置")]
+                 ("Ctrl + ,", "打开设置"), ("F5", "重新加载配置"),
+                 ("Ctrl + M", "管理自选股"), ("Ctrl + H", "持仓设置"),
+                 ("Esc", "关闭窗口/卡片")]
         for k, v in items:
-            r = tk.Frame(sec, bg=pal["panel_alt"])
-            r.pack(fill="x", pady=2)
-            tk.Label(r, text=k, width=10, anchor="w", bg=pal["panel_alt"],
-                     fg=pal["muted"], font=self.fonts.num(-3, False)).pack(side="left")
+            r = self.row(sec, k)
             tk.Label(r, text=v, anchor="w", bg=pal["panel_alt"],
                      fg=pal["text_dim"], font=self.fonts.label()).pack(side="left")
 
@@ -919,7 +862,9 @@ class SettingsWindow(BaseDialog):
         sec = self.section(parent, "小提示")
         for text in ("按住左键拖动，可放到任务栏上悬浮",
                      "悬停片刻显示分时与持仓详情",
-                     "背景不透明度调到 0% 只显示文字"):
+                     "背景不透明度调到 0% 只显示文字",
+                     "卡片透明度可让悬停详情卡半透明",
+                     "嵌入任务栏后可左右拖动换位置"):
             r = tk.Frame(sec, bg=pal["panel_alt"])
             r.pack(fill="x", pady=2)
             tk.Label(r, text="·", bg=pal["panel_alt"], fg=pal["accent"],
@@ -971,6 +916,10 @@ class SettingsWindow(BaseDialog):
     def _set_bg_opacity(self, value):
         self.app.cfg["bg_opacity"] = max(0.0, min(1.0, value / 100.0))
         self._apply()
+
+    def _set_card_opacity(self, value):
+        self.app.cfg["card_opacity"] = max(0.10, min(1.0, value / 100.0))
+        self._apply()          # 卡片开着时 refresh() 内即时应用新透明度
 
     def _set_card_mode(self, value):
         self.app.cfg["card_mode"] = value
@@ -1570,9 +1519,7 @@ class HoldingsWindow(BaseDialog):
             self.h_top = int(round(avail * self.h_top / cur))
             self.h_log = avail - self.h_top
             self._apply_lists()
-        self.make_resizable(int(820 * S), self._fixed_px + 2 * self.min_list,
-                            on_resize=self._on_win_resize,
-                            on_release=self._save_layout)
+        self.set_resize_handler(self._on_win_resize, self._save_layout)
         self._save_layout()
 
     def _apply_lists(self):
@@ -1606,7 +1553,6 @@ class HoldingsWindow(BaseDialog):
             if (h, y) != (self.win.winfo_height(), self.win.winfo_y()):
                 # 只改几何(轻量): 逐次强制重排是拖动卡顿的来源
                 self.win.geometry(f"{self.win.winfo_width()}x{h}+{x}+{y}")
-                self._request_round()
 
     def _on_win_resize(self, w, h):
         """窗口拉大/缩小时, 多出的高度按当前比例分给两个列表(各有最小值)。"""

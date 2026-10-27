@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
     "show_name": True,        # 胶囊里是否显示股票名称
     "cn_colors": True,        # True=红涨绿跌, False=绿涨红跌
     "card_mode": "detail",    # detail=详细(含分时图) | simple=简洁(纯文字)
+    "card_opacity": 1.0,      # 悬停卡片透明度 0.10 ~ 1.0
     "dock_taskbar": False,    # True=嵌入任务栏(左), 拖动只在任务栏内滑动
 }
 
@@ -154,6 +155,11 @@ def normalize_config(raw: dict | None) -> dict:
         cfg["appearance"] = "pill"
     if cfg.get("card_mode") not in ("detail", "simple"):
         cfg["card_mode"] = "detail"
+    try:
+        card_op = float(cfg.get("card_opacity", 1.0))
+    except (TypeError, ValueError):
+        card_op = 1.0
+    cfg["card_opacity"] = max(0.10, min(1.0, card_op))
     if cfg.get("theme") not in ("dark", "light"):
         cfg["theme"] = "dark"
     cfg["dock_taskbar"] = bool(cfg.get("dock_taskbar", False))
@@ -594,6 +600,7 @@ class StockBar:
         self._topmost_on = None
 
         self.root = tk.Tk()
+        self.root.report_callback_exception = self._tk_callback_error
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)
         # 文字层: 色键 = 胶囊底色, ClearType 会混到底色上, 文字锐利无彩边
@@ -1236,7 +1243,21 @@ class StockBar:
         if self._card and self._card.visible:
             self._card.refresh()
         if any(v > now for v in self._flash.values()):
-            self.root.after(240, lambda: self._render_bar(force=True))
+            self.root.after(240, self._safe_render)
+
+    def _safe_render(self):
+        """延迟渲染的安全包装: 窗口销毁后残留的 after 回调不再报错。"""
+        try:
+            self._render_bar(force=True)
+        except tk.TclError:
+            pass
+
+    def _tk_callback_error(self, exc, val, tb):
+        """Tk 回调异常统一进日志(打包成窗口程序时写 stderr 可能引发二次崩溃)。"""
+        try:
+            self._log("界面回调异常: %s: %s" % (getattr(exc, "__name__", exc), val))
+        except Exception:
+            pass
 
     def _set_error(self, error: bool):
         if self._error != error:
