@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.3.0"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -962,10 +962,13 @@ class StockBar:
         x = pad
         cy = h / 2
         self._index_zone_left = None
+        self._zone_pnl_left = None
         for p in parts:
             x += p["gap"]
             color = p["color"]
             if p["kind"] == "sep":
+                if self._zone_pnl_left is None:
+                    self._zone_pnl_left = x     # 第一条分隔线 = 持仓段左界
                 c.create_line(x, h * 0.3, x, h * 0.7, fill=color)
                 x += 1
             else:
@@ -1096,7 +1099,13 @@ class StockBar:
             x, y, w, h = self.bar_rect()
             inside = x <= px <= x + w and y <= py <= y + h
             if inside:
-                zone = ("index" if (px - x) >= (self._index_zone_left or w) else "pick")
+                rel = px - x
+                if rel >= (self._index_zone_left or w):
+                    zone = "index"
+                elif self._zone_pnl_left is not None and rel >= self._zone_pnl_left:
+                    zone = "pnl"
+                else:
+                    zone = "pick"
                 if not self._hovering:
                     self._hovering = True
                     self._hover_zone = zone
@@ -1136,6 +1145,9 @@ class StockBar:
     def _show_card(self):
         self._hover_after = None
         if not self._hovering or self._menu:
+            return
+        if self._hover_zone == "pnl":
+            self._card.show_holdings()      # 持仓段: 真实持仓总览
             return
         code = self.index_code if self._hover_zone == "index" else self._current_pick_code()
         if not code or code not in self.quotes:

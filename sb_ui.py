@@ -72,6 +72,7 @@ class InfoCard:
         self.canvas = tk.Canvas(self.win, bg=KEY_COLOR, highlightthickness=0, bd=0)
         self.canvas.pack()
         self.code = None
+        self.kind = "stock"          # stock=个股/指数详情卡 | holdings=持仓总览卡
         self.series = None
         self.state = "idle"
         self.visible = False
@@ -98,11 +99,24 @@ class InfoCard:
         if not code or code not in self.app.quotes:
             self.hide()
             return
-        if code != self.code:
+        if self.kind != "stock" or code != self.code:
+            self.kind = "stock"
             self.code = code
             self.series = None
             self.state = "loading"
             self.app.request_minutes(code, self._on_minutes)
+        self.visible = True
+        self._render()
+        self._place()
+        self.apply_alpha()
+        self.win.deiconify()
+        force_topmost(self.win)
+        self.win.lift()
+
+    def show_holdings(self):
+        """显示持仓总览卡(悬停行情条的持仓段时)。"""
+        self.kind = "holdings"
+        self.code = None
         self.visible = True
         self._render()
         self._place()
@@ -147,6 +161,120 @@ class InfoCard:
         pos, _ = D.position_of(h.get("trades"))
         return pos if pos.lots > 0 else None
 
+    def _render_holdings(self):
+        """持仓总览卡: 真实持仓每只两行 + 底部汇总(悬停行情条持仓段时显示)。"""
+        pal = self.app.pal
+        fonts = self.app.card_fonts
+        S = self.app.scale * 0.875
+        pad = int(16 * S)
+        w = int(self.WIDTH * S)
+        MAX_ROWS = 8
+
+        codes = [c for c in self.app.pick_codes if c]
+        for c in (self.app.cfg.get("holdings") or {}):
+            if c and c not in codes:
+                codes.append(c)
+        rows = []
+        mv = day = fl = real = 0.0
+        for code in codes:
+            h = self.app.cfg.get("holdings", {}).get(code)
+            if not h:
+                continue
+            pos, _ = D.position_of(h.get("trades"))
+            q = self.app.quotes.get(code)
+            real += pos.realized        # 汇总口径含清仓股的历史盈亏
+            if pos.lots <= 0:
+                continue                 # 明细只列当前持仓, 清仓股不列
+            name = q.name if q else code
+            price = q.price if q else 0.0
+            fv = ((price - pos.avg_cost) * pos.lots * 100
+                  if (q and pos.lots > 0 and pos.avg_cost > 0) else None)
+            dv = (price - q.prev_close) * pos.lots * 100 if (q and pos.lots > 0) else None
+            mv += price * pos.lots * 100
+            day += dv or 0.0
+            fl += fv or 0.0
+            rows.append((name, pos.lots, pos.avg_cost, fv, dv, pos.realized))
+
+        hidden = max(0, len(rows) - MAX_ROWS)
+        rows = rows[:MAX_ROWS]
+        total = real + fl
+
+        # 布局
+        y = pad
+        y += int(24 * S)                     # 标题
+        y += int(8 * S)
+        row_y = []
+        for _ in rows:
+            row_y.append(y)
+            y += int(44 * S)                 # 每只两行: 行1 名称, 行2 浮动(两股之间偏上)
+        if hidden:
+            y += int(16 * S)
+        y += int(8 * S)
+        div_y = y
+        y += int(12 * S)
+        sum_y = y
+        y += int(20 * S) * 3
+        h = int(y + pad)
+
+        self.w, self.h = w, h
+        c = self.canvas
+        c.configure(width=w, height=h)
+        c.delete("all")
+        draw_round_rect(c, 0.5, 0.5, w - 0.5, h - 0.5, 14 * S,
+                        pal["card_bg"], pal["card_border"], 1)
+
+        # 标题 + 只数徽标
+        c.create_text(pad, pad, text="持仓总览", anchor="nw", fill=pal["text"],
+                      font=fonts.card_title())
+        badge = "%d 只" % (len(rows) + hidden)
+        bw = fonts.tiny().measure(badge) + 14 * S
+        draw_round_rect(c, w - pad - bw, pad + 1 * S, w - pad, pad + 19 * S, 9 * S,
+                        pal["panel_alt"], pal["border_soft"], 1)
+        c.create_text(w - pad - bw / 2, pad + 10 * S, text=badge,
+                      fill=pal["text_dim"], font=fonts.tiny())
+
+        # 每只持仓: 行1(顶对齐) 名称+持仓+成本, 行2(中线对齐) 浮动+今日
+        for i, (name, lots, cost, fv, dv, rl) in enumerate(rows):
+            y = row_y[i]
+            c.create_text(pad, y, text=name[:7], anchor="nw", fill=pal["text"],
+                          font=fonts.label())
+            c.create_text(w - pad, y, anchor="ne", fill=pal["muted"],
+                          font=fonts.num(-3, False),
+                          text="%d手  成本 %s" % (lots, D.fmt_price(cost, 3 if cost < 5 else 2)))
+            v = fv if fv is not None else 0.0
+            _text_run(c, pad, y + int(28 * S),
+                      [("浮动 ", fonts.tiny(), pal["muted"]),
+                       (D.fmt_money_signed(v), fonts.num(-3, True), D.change_color(v, pal)),
+                       ("    今日 ", fonts.tiny(), pal["muted"]),
+                       (D.fmt_money_signed(dv or 0.0), fonts.num(-3, True),
+                        D.change_color(dv or 0.0, pal))])
+
+        if hidden:
+            c.create_text(pad, row_y[-1] + int(46 * S), anchor="nw",
+                          text="… 等 %d 只" % hidden, fill=pal["faint"], font=fonts.tiny())
+
+        # 汇总(有持仓才画)
+        if rows:
+            c.create_line(pad, div_y, w - pad, div_y, fill=pal["border_soft"])
+            col_w = (w - 2 * pad - int(16 * S)) / 2
+            cells = (("持仓市值", D.fmt_money(mv), pal["text_dim"], False),
+                     ("今日盈亏", D.fmt_money_signed(day), D.change_color(day, pal), False),
+                     ("浮动盈亏", D.fmt_money_signed(fl), D.change_color(fl, pal), False),
+                     ("已实现", D.fmt_money_signed(real), D.change_color(real, pal), False),
+                     ("总盈亏", D.fmt_money_signed(total), D.change_color(total, pal), True))
+            for i, (k, v, color, bold) in enumerate(cells):
+                cx = pad if i % 2 == 0 else pad + col_w + int(16 * S)
+                cy = sum_y + (i // 2) * int(20 * S)
+                c.create_text(cx, cy, text=k, anchor="w", fill=pal["muted"], font=fonts.tiny())
+                c.create_text(cx + col_w, cy, text=v, anchor="e", fill=color,
+                              font=fonts.num(-3, bold))
+        else:
+            c.create_text(w / 2, sum_y + int(2 * S), text="暂无持仓",
+                          anchor="center", fill=pal["faint"], font=fonts.label())
+            c.create_text(w / 2, sum_y + int(22 * S),
+                          text="去「持仓设置」开启模拟盘", anchor="center",
+                          fill=pal["muted"], font=fonts.tiny())
+
     def _plan(self, q):
         S = self.app.scale * 0.875
         pad = int(16 * S)
@@ -189,6 +317,9 @@ class InfoCard:
 
     # ---------- 绘制 ----------
     def _render(self):
+        if self.kind == "holdings":
+            self._render_holdings()
+            return
         q = self.app.quotes.get(self.code)
         if not q:
             self.hide()
