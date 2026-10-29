@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import socket
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+
+# 兜底: urlopen 的 timeout 不覆盖 DNS 解析, 网络抖动时会让取数线程无限挂起
+socket.setdefaulttimeout(10.0)
 
 QUOTE_URL = "https://qt.gtimg.cn/q={codes}"
 SINA_URL = "https://hq.sinajs.cn/list={codes}"
@@ -232,6 +236,43 @@ def position_of(trades):
     return pos, rows
 
 
+def day_pnl_of(trades, price: float, prev_close: float, today: str = "") -> float:
+    """今日盈亏(元) —— 分段计算:
+    - 昨日及以前买入的股数: (现价 - 昨收) * 股数   ← 今天赚/亏的钱
+    - 今天买入的股数:       (现价 - 当日买入价) * 股数 ← 从成本到现在的盈亏
+    当日买入多于当前持仓时(当日又卖出), 按当前持仓里"新买"的部分折算。
+    """
+    pos, _ = position_of(trades)
+    held = pos.lots * 100
+    if held <= 0 or price <= 0:
+        return 0.0
+    today = today or _dt.date.today().isoformat()
+    new_shares = 0
+    new_amount = 0.0
+    for t in trades or []:
+        if not isinstance(t, dict) or t.get("side") != "buy":
+            continue
+        if str(t.get("time", ""))[:10] != today:
+            continue
+        try:
+            lots = int(t.get("lots") or 0)
+            p = float(t.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lots > 0 and p > 0:
+            new_shares += lots * 100
+            new_amount += lots * 100.0 * p
+    if new_shares > held:                 # 当日买后又卖: 只保留当前持仓中的新买部分
+        ratio = held / new_shares
+        new_shares = held
+        new_amount *= ratio
+    old_shares = held - new_shares
+    pnl = old_shares * (price - prev_close) if prev_close > 0 else 0.0
+    if new_shares > 0:
+        pnl += new_shares * (price - new_amount / new_shares)
+    return pnl
+
+
 def _price_dp(raw: str) -> int:
     raw = (raw or "").strip()
     if "." in raw:
@@ -349,18 +390,23 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
     tencent: dict[str, Quote] = {}
     sina: dict[str, Quote] = {}
     errors: list[Exception] = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
         f_qq = pool.submit(_fetch_tencent, codes, index_set, timeout)
         f_sn = pool.submit(_fetch_sina, codes, index_set, timeout)
-        for fut, name in ((f_qq, "腾讯"), (f_sn, "新浪")):
+        for fut, name, key in ((f_qq, "腾讯", "tencent"), (f_sn, "新浪", "sina")):
             try:
-                data = fut.result()
-                if fut is f_qq:
-                    tencent = data
-                else:
-                    sina = data
-            except Exception as exc:      # 单源失败不影响另一源
+                data = fut.result(timeout=timeout + 2.0)   # 有界等待: 单源卡死不拖垮整体
+            except Exception as exc:      # 单源失败/超时不影响另一源
                 errors.append(exc if isinstance(exc, Exception) else RuntimeError(name))
+                continue
+            if key == "tencent":
+                tencent = data
+            else:
+                sina = data
+    finally:
+        # 不等挂住的线程: 立刻返回, 让上层继续用已有数据
+        pool.shutdown(wait=False, cancel_futures=True)
     if not tencent and not sina:
         raise errors[0] if errors else RuntimeError("行情源无数据")
 

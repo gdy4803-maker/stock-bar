@@ -189,7 +189,8 @@ class InfoCard:
             price = q.price if q else 0.0
             fv = ((price - pos.avg_cost) * pos.lots * 100
                   if (q and pos.lots > 0 and pos.avg_cost > 0) else None)
-            dv = (price - q.prev_close) * pos.lots * 100 if (q and pos.lots > 0) else None
+            dv = (D.day_pnl_of(h.get("trades"), price, q.prev_close)
+                  if (q and pos.lots > 0) else None)
             mv += price * pos.lots * 100
             day += dv or 0.0
             fl += fv or 0.0
@@ -401,7 +402,9 @@ class InfoCard:
             lots = hold.lots
             shares = lots * 100
             mv = q.price * shares
-            dpnl = (q.price - q.prev_close) * shares
+            dpnl = D.day_pnl_of(
+                (self.app.cfg.get("holdings", {}).get(q.code) or {}).get("trades"),
+                q.price, q.prev_close)
             left = [("持仓 ", fonts.label(), pal["muted"]),
                     (f"{lots}手", fonts.label(), pal["text_dim"])]
             if hold.avg_cost > 0:
@@ -919,6 +922,12 @@ class SettingsWindow(BaseDialog):
         Segmented(r, [(True, "红涨绿跌"), (False, "绿涨红跌")],
                   bool(self.app.cfg["cn_colors"]), self._set_cn_colors,
                   pal, self.fonts).pack(side="left")
+        r = self.row(sec, "持仓显示")
+        Segmented(r, [("money", "金额"), ("pct", "涨幅")],
+                  self.app.cfg.get("pnl_display", "money"), self._set_pnl_display,
+                  pal, self.fonts).pack(side="left")
+        tk.Label(r, text="行情条中间那段", bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "详情卡")
         Segmented(r, [("simple", "简洁"), ("detail", "详细")],
                   self.app.cfg.get("card_mode", "detail"), self._set_card_mode,
@@ -1099,6 +1108,10 @@ class SettingsWindow(BaseDialog):
 
     def _set_interval(self, value):
         self.app.cfg["interval_seconds"] = float(value)
+        self._apply()
+
+    def _set_pnl_display(self, value):
+        self.app.cfg["pnl_display"] = "pct" if value == "pct" else "money"
         self._apply()
 
     def _set_cn_colors(self, value):
@@ -1729,13 +1742,14 @@ class HoldingsWindow(BaseDialog):
     def _row_values(self, code):
         q = self.app.quotes.get(code)
         pos = self._pos(code)
+        trades = (self.app.cfg.get("holdings", {}).get(code) or {}).get("trades")
         name = q.name if q else code
         price = D.fmt_price(q.price, q.dp) if q else "--"
         realized = D.fmt_money_signed(pos.realized) if abs(pos.realized) > 0.004 else "-"
         if q and pos.lots > 0:
             shares = pos.lots * 100
             fv = (q.price - pos.avg_cost) * shares if pos.avg_cost > 0 else None
-            day = (q.price - q.prev_close) * shares
+            day = D.day_pnl_of(trades, q.price, q.prev_close)
             ref = fv if fv is not None else day
             tag = "up" if ref > 0 else ("down" if ref < 0 else "flat")
             values = (name, D.code_digits(code), price, str(pos.lots),

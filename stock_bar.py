@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.5"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
     "cn_colors": True,        # True=红涨绿跌, False=绿涨红跌
     "card_mode": "detail",    # detail=详细(含分时图) | simple=简洁(纯文字)
     "card_opacity": 1.0,      # 悬停卡片透明度 0.10 ~ 1.0
+    "pnl_display": "money",   # 行情条持仓段显示: money=当日盈亏金额 | pct=涨幅
     "dock_taskbar": False,    # True=嵌入任务栏(左), 拖动只在任务栏内滑动
 }
 
@@ -160,6 +161,8 @@ def normalize_config(raw: dict | None) -> dict:
     except (TypeError, ValueError):
         card_op = 1.0
     cfg["card_opacity"] = max(0.10, min(1.0, card_op))
+    if cfg.get("pnl_display") not in ("money", "pct"):
+        cfg["pnl_display"] = "money"
     if cfg.get("theme") not in ("dark", "light"):
         cfg["theme"] = "dark"
     cfg["dock_taskbar"] = bool(cfg.get("dock_taskbar", False))
@@ -576,6 +579,7 @@ class StockBar:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._gen = 0
+        self._last_msg_at = time.time()      # 看门狗: 最近一次收到取数线程消息的时间
         self._minute_cache: dict[str, tuple[float, D.MinuteSeries | None]] = {}
         self._minute_pending: set[str] = set()
         self._minute_waiters: dict[str, list] = {}
@@ -760,7 +764,7 @@ class StockBar:
         mode = self.cfg["appearance"]
         pick = self.quotes.get(self._current_pick_code())
         idx = self.quotes.get(self.index_code)
-        pnl = self._total_pnl_pct()
+        pnl = self._pnl_display_value()
         parts = []
 
         def add(text, font, color, gap=0, kind="text"):
@@ -774,7 +778,10 @@ class StockBar:
         idx_color = self._flash_color("index", self._color(idx_pct, pal), pal)
         idx_text = D.fmt_pct(idx_pct)
         pnl_color = self._flash_color("pnl", self._color(pnl, pal), pal)
-        pnl_text = D.fmt_pct(pnl)
+        if self.cfg.get("pnl_display", "money") == "pct":
+            pnl_text = D.fmt_pct(pnl) if pnl is not None else "--"
+        else:
+            pnl_text = D.fmt_money_signed(pnl) if pnl is not None else "--"
         name = _short_name(pick.name, 4) if pick else ""
 
         if mode == "compact":
@@ -1207,9 +1214,15 @@ class StockBar:
     def _poll_queue(self):
         if not self.root.winfo_exists():
             return
+        # 看门狗: 取数线程挂死(DNS/网络抖动)超过 20 秒没有消息就自动重启
+        if self._worker is not None and time.time() - self._last_msg_at > 20.0:
+            self._last_msg_at = time.time()
+            self._log("行情线程超时无响应, 自动重启")
+            self._restart_worker(force=True)
         try:
             while True:
                 kind, *payload = self._q.get_nowait()
+                self._last_msg_at = time.time()
                 if kind == "data":
                     gen, quotes = payload
                     if gen == self._gen:
@@ -1246,7 +1259,7 @@ class StockBar:
             if old is not None and abs(old - new.pct) > 1e-9:
                 self._flash[role] = now + 0.22
             self._last_vals[role] = new.pct
-        pnl = self._total_pnl_pct()
+        pnl = self._pnl_display_value()
         if pnl is not None and self._last_vals.get("pnl") is not None:
             if abs(self._last_vals["pnl"] - pnl) > 1e-9:
                 self._flash["pnl"] = now + 0.22
@@ -1301,6 +1314,31 @@ class StockBar:
             return None
         return total_pnl / total_base * 100.0
 
+    def _total_day_pnl(self):
+        """持仓当日盈亏合计(元): 老仓按昨收、当日新买按买入价(见 D.day_pnl_of)。"""
+        total = 0.0
+        holdings = self.cfg.get("holdings", {})
+        codes = [c for c in self.pick_codes if c]
+        for c in holdings:
+            if c and c not in codes:
+                codes.append(c)
+        for code in codes:
+            h = holdings.get(code)
+            q = self.quotes.get(code)
+            if not h or not q:
+                continue
+            pos, _ = D.position_of(h.get("trades"))
+            if pos.lots <= 0:
+                continue
+            total += D.day_pnl_of(h.get("trades"), q.price, q.prev_close)
+        return total
+
+    def _pnl_display_value(self):
+        """持仓段显示值: 按设置返回涨幅(%)或当日盈亏(元)。"""
+        if self.cfg.get("pnl_display", "money") == "pct":
+            return self._total_pnl_pct()
+        return self._total_day_pnl()
+
     # ---------- 分时 ----------
     def request_minutes(self, code: str, callback):
         if not code:
@@ -1350,6 +1388,7 @@ class StockBar:
             if q:
                 label += "  " + D.fmt_pct(q.pct)
             stock_items.append({"type": "check", "label": label, "checked": code == pick_code,
+                                "checked_fn": (lambda c=code: c == self._current_pick_code()),
                                 "command": lambda c=code: self._select_pick(c)})
         if stock_items:
             items.append({"type": "sub", "label": "切换股票", "items": stock_items})
@@ -1357,12 +1396,15 @@ class StockBar:
         for sec in INTERVALS:
             iv_items.append({"type": "check", "label": f"{sec:g} 秒",
                              "checked": abs(self.cfg["interval_seconds"] - sec) < 1e-6,
+                             "checked_fn": (lambda s=sec: abs(self.cfg["interval_seconds"] - s) < 1e-6),
                              "command": lambda s=sec: self.set_interval(s)})
         items.append({"type": "sub", "label": "刷新间隔", "items": iv_items})
         items.append({"type": "check", "label": "窗口置顶", "checked": bool(self.cfg["topmost"]),
+                      "checked_fn": lambda: bool(self.cfg["topmost"]),
                       "command": self.toggle_topmost})
         items.append({"type": "check", "label": "嵌入任务栏（左）",
                       "checked": bool(self.cfg.get("dock_taskbar")),
+                      "checked_fn": lambda: bool(self.cfg.get("dock_taskbar")),
                       "command": self.toggle_dock})
         items.append({"type": "sep"})
         items.append({"type": "cmd", "label": "复制当前行情", "shortcut": "Ctrl+C",
@@ -1543,7 +1585,7 @@ class StockBar:
             if h and not q.is_index:
                 pos, _ = D.position_of(h.get("trades"))
                 if pos.lots > 0:
-                    dpnl = (q.price - q.prev_close) * pos.lots * 100
+                    dpnl = D.day_pnl_of(h.get("trades"), q.price, q.prev_close)
                     lines.append(f"    持仓 {pos.lots}手  当日盈亏 {D.fmt_money_signed(dpnl)}")
         try:
             self.input.clipboard_clear()

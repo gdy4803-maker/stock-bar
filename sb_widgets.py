@@ -340,6 +340,7 @@ class MenuPopup(tk.Toplevel):
         self._closed = False
         self._press_was_down = self._mouse_down()
         self._outside_since = None
+        self._hover_seen = False
 
         self.withdraw()
         self.overrideredirect(True)
@@ -493,6 +494,8 @@ class MenuPopup(tk.Toplevel):
 
     def _open_sub(self, idx):
         self._sub_after = None
+        self._outside_since = None      # 跨层移动: 重置离开计时, 避免误收
+        self._hover_seen = True
         if not self.winfo_exists():
             return
         for child in list(self.submenus):
@@ -521,12 +524,34 @@ class MenuPopup(tk.Toplevel):
         if it["type"] == "sub":
             self._open_sub(idx)
             return
-        if it["type"] in ("cmd", "check"):
+        if it["type"] == "check":
+            # 勾选项(开关/选择): 菜单保持打开, 勾选就地翻转, 可连续切换
+            cb = it.get("command")
+            if callable(cb):
+                cb()
+            self._refresh_checks()
+            return
+        if it["type"] == "cmd":
             cb = it.get("command")
             master = self.master
             self.close_root()
             if callable(cb):
                 master.after(10, cb)
+
+    def _refresh_checks(self):
+        """重新读取各勾选项状态并重绘(菜单保持打开)。"""
+        for it in self.items:
+            if it["type"] != "check":
+                continue
+            fn = it.get("checked_fn")
+            if callable(fn):
+                try:
+                    it["checked"] = bool(fn())
+                    continue
+                except Exception:
+                    pass
+            it["checked"] = not bool(it.get("checked"))
+        self._draw()
 
     @staticmethod
     def _mouse_down() -> bool:
@@ -560,8 +585,13 @@ class MenuPopup(tk.Toplevel):
         except tk.TclError:
             pass
 
+    # 悬停保持: 在菜单内一直保留; 从未悬停 0.6s 收起; 悬停过又移开 0.2s 收起
+    TTL_NEVER_HOVER = 0.6
+    TTL_LEFT = 0.2
+
     def _watch_hover(self):
-        """鼠标离开菜单（含子菜单）超过 3 秒自动收起; 在菜单内则一直保留。"""
+        """分级自动收起: 悬停(含子菜单)时一直保留;
+        打开后从未悬停 0.6 秒收起, 悬停过又移开 0.2 秒收起。"""
         if self._closed:
             return
         try:
@@ -576,15 +606,17 @@ class MenuPopup(tk.Toplevel):
                 except tk.TclError:
                     continue
             if inside:
+                self._hover_seen = True
                 self._outside_since = None
             else:
                 now = time.time()
                 if self._outside_since is None:
                     self._outside_since = now
-                elif now - self._outside_since >= 3.0:
+                limit = self.TTL_LEFT if self._hover_seen else self.TTL_NEVER_HOVER
+                if now - self._outside_since >= limit:
                     self.close_root()
                     return
-            self.after(100, self._watch_hover)
+            self.after(60, self._watch_hover)      # 60ms: 0.2s 档才够准
         except tk.TclError:
             pass
 
