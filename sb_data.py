@@ -237,39 +237,51 @@ def position_of(trades):
 
 
 def day_pnl_of(trades, price: float, prev_close: float, today: str = "") -> float:
-    """今日盈亏(元) —— 分段计算:
-    - 昨日及以前买入的股数: (现价 - 昨收) * 股数   ← 今天赚/亏的钱
-    - 今天买入的股数:       (现价 - 当日买入价) * 股数 ← 从成本到现在的盈亏
-    当日买入多于当前持仓时(当日又卖出), 按当前持仓里"新买"的部分折算。
+    """今日盈亏(元) —— 每一份股数都有"参考价", 离场/持有都结算:
+
+    参考价: 昨日就有的股数 → 昨收; 今天买入的股数 → 买入价
+    结算价: 今天卖出的股数 → 卖出价; 现在还持有的股数 → 现价
+
+    今日成交按时间顺序 FIFO: 卖出先消耗最老的份额并按其参考价当场结算,
+    所以"买入后卖出""清仓"当天同样有今日盈亏。超卖部分忽略(与持仓推导一致)。
     """
-    pos, _ = position_of(trades)
-    held = pos.lots * 100
-    if held <= 0 or price <= 0:
-        return 0.0
     today = today or _dt.date.today().isoformat()
-    new_shares = 0
-    new_amount = 0.0
-    for t in trades or []:
-        if not isinstance(t, dict) or t.get("side") != "buy":
-            continue
-        if str(t.get("time", ""))[:10] != today:
-            continue
+    items = [t for t in (trades or []) if isinstance(t, dict)]
+    # 1) 今日之前的成交 -> 昨收时的持仓, 作为"老仓"份额(参考价=昨收)
+    prior = [t for t in items if str(t.get("time", ""))[:10] < today]
+    prior_pos, _ = position_of(prior)
+    tranches: list[list[float]] = []
+    if prior_pos.lots > 0 and prev_close > 0:
+        tranches.append([float(prior_pos.lots * 100), float(prev_close)])
+    # 2) 今日成交: 买=追加份额(参考价=买价), 卖=FIFO 消耗并当场结算
+    day = [t for t in items if str(t.get("time", ""))[:10] == today]
+    day.sort(key=lambda t: str(t.get("time", "")))
+    pnl = 0.0
+    for t in day:
         try:
-            lots = int(t.get("lots") or 0)
-            p = float(t.get("price") or 0)
+            tp = float(t.get("price") or 0)
+            shares = float(int(t.get("lots") or 0) * 100)
         except (TypeError, ValueError):
             continue
-        if lots > 0 and p > 0:
-            new_shares += lots * 100
-            new_amount += lots * 100.0 * p
-    if new_shares > held:                 # 当日买后又卖: 只保留当前持仓中的新买部分
-        ratio = held / new_shares
-        new_shares = held
-        new_amount *= ratio
-    old_shares = held - new_shares
-    pnl = old_shares * (price - prev_close) if prev_close > 0 else 0.0
-    if new_shares > 0:
-        pnl += new_shares * (price - new_amount / new_shares)
+        if shares <= 0 or tp <= 0:
+            continue
+        side = t.get("side")
+        if side == "buy":
+            tranches.append([shares, tp])
+        elif side == "sell":
+            remain = shares
+            while remain > 0 and tranches:
+                tr = tranches[0]
+                take = min(remain, tr[0])
+                pnl += (tp - tr[1]) * take      # 卖出价 - 该份额的参考价
+                tr[0] -= take
+                remain -= take
+                if tr[0] <= 1e-9:
+                    tranches.pop(0)
+    # 3) 剩余份额用现价结算
+    for shares, ref in tranches:
+        if shares > 0 and price > 0:
+            pnl += (price - ref) * shares
     return pnl
 
 
