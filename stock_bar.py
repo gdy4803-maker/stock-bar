@@ -1328,8 +1328,8 @@ class StockBar:
             if not h or not q:
                 continue
             pos, _ = D.position_of(h.get("trades"))
-            if pos.lots <= 0:
-                continue
+            if pos.lots <= 0 and not D.sold_today(h.get("trades")):
+                continue                 # 今日清仓也计入(今天亏的钱就是今天的)
             total += D.day_pnl_of(h.get("trades"), q.price, q.prev_close)
         return total
 

@@ -183,14 +183,14 @@ class InfoCard:
             pos, _ = D.position_of(h.get("trades"))
             q = self.app.quotes.get(code)
             real += pos.realized        # 汇总口径含清仓股的历史盈亏
-            if pos.lots <= 0:
-                continue                 # 明细只列当前持仓, 清仓股不列
+            closed_today = pos.lots <= 0 and D.sold_today(h.get("trades"))
+            if pos.lots <= 0 and not closed_today:
+                continue                 # 只列当前持仓 + 今日清仓; 更早的清仓不列
             name = q.name if q else code
             price = q.price if q else 0.0
             fv = ((price - pos.avg_cost) * pos.lots * 100
                   if (q and pos.lots > 0 and pos.avg_cost > 0) else None)
-            dv = (D.day_pnl_of(h.get("trades"), price, q.prev_close)
-                  if (q and pos.lots > 0) else None)
+            dv = D.day_pnl_of(h.get("trades"), price, q.prev_close) if q else None
             mv += price * pos.lots * 100
             day += dv or 0.0
             fl += fv or 0.0
@@ -239,16 +239,20 @@ class InfoCard:
             y = row_y[i]
             c.create_text(pad, y, text=name[:7], anchor="nw", fill=pal["text"],
                           font=fonts.label())
+            cost_txt = D.fmt_price(cost, 3 if cost < 5 else 2) if cost > 0 else "-"
             c.create_text(w - pad, y, anchor="ne", fill=pal["muted"],
                           font=fonts.num(-3, False),
-                          text="%d手  成本 %s" % (lots, D.fmt_price(cost, 3 if cost < 5 else 2)))
-            v = fv if fv is not None else 0.0
-            _text_run(c, pad, y + int(28 * S),
-                      [("浮动 ", fonts.tiny(), pal["muted"]),
-                       (D.fmt_money_signed(v), fonts.num(-3, True), D.change_color(v, pal)),
-                       ("    今日 ", fonts.tiny(), pal["muted"]),
-                       (D.fmt_money_signed(dv or 0.0), fonts.num(-3, True),
-                        D.change_color(dv or 0.0, pal))])
+                          text="%d手  成本 %s" % (lots, cost_txt))
+            runs = [("浮动 ", fonts.tiny(), pal["muted"])]
+            if fv is None:                    # 今日清仓: 无浮动持仓
+                runs.append(("-", fonts.num(-3, False), pal["faint"]))
+            else:
+                runs.append((D.fmt_money_signed(fv), fonts.num(-3, True),
+                             D.change_color(fv, pal)))
+            runs += [("    今日 ", fonts.tiny(), pal["muted"]),
+                     (D.fmt_money_signed(dv or 0.0), fonts.num(-3, True),
+                      D.change_color(dv or 0.0, pal))]
+            _text_run(c, pad, y + int(28 * S), runs)
 
         if hidden:
             c.create_text(pad, row_y[-1] + int(46 * S), anchor="nw",
@@ -1756,9 +1760,11 @@ class HoldingsWindow(BaseDialog):
                       D.fmt_price(pos.avg_cost, q.dp) if pos.avg_cost > 0 else "-",
                       D.fmt_money_signed(fv) if fv is not None else "-",
                       D.fmt_money_signed(day), realized)
-        elif abs(pos.realized) > 0.004:
-            # 已清仓: 仍显示历史已实现盈亏
-            values = (name, D.code_digits(code), price, "0", "-", "-", "-", realized)
+        elif abs(pos.realized) > 0.004 or D.sold_today(trades):
+            # 已清仓: 显示历史已实现盈亏; 今日清仓的还要显示今天的盈亏
+            day = D.day_pnl_of(trades, q.price, q.prev_close) if q else None
+            day_txt = D.fmt_money_signed(day) if (day is not None and abs(day) > 0.004) else "-"
+            values = (name, D.code_digits(code), price, "0", "-", "-", day_txt, realized)
             tag = "up" if pos.realized > 0 else "down"
         else:
             values = (name, D.code_digits(code), price, "-", "-", "-", "-", "-")

@@ -285,6 +285,21 @@ def day_pnl_of(trades, price: float, prev_close: float, today: str = "") -> floa
     return pnl
 
 
+def sold_today(trades, today: str = "") -> bool:
+    """今天是否有卖出成交(用于识别"今日清仓", 今天清仓的仍计入今日盈亏)。"""
+    today = today or _dt.date.today().isoformat()
+    for t in (trades or []):
+        if not isinstance(t, dict) or t.get("side") != "sell":
+            continue
+        if str(t.get("time", ""))[:10] == today:
+            try:
+                if int(t.get("lots") or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
 def _price_dp(raw: str) -> int:
     raw = (raw or "").strip()
     if "." in raw:
