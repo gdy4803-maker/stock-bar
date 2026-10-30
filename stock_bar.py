@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -580,6 +580,9 @@ class StockBar:
         self._worker: threading.Thread | None = None
         self._gen = 0
         self._last_msg_at = time.time()      # 看门狗: 最近一次收到取数线程消息的时间
+        self._update_info = None             # 发现的新版本 {tag,url,size}
+        self._update_stage = ""              # 更新进度文案
+        self._updating = False
         self._minute_cache: dict[str, tuple[float, D.MinuteSeries | None]] = {}
         self._minute_pending: set[str] = set()
         self._minute_waiters: dict[str, list] = {}
@@ -1235,6 +1238,16 @@ class StockBar:
                     elif kind == "minutes":
                         code, series = payload
                         self._on_minutes(code, series)
+                    elif kind == "update_check":
+                        self._on_update_check(payload[0])
+                    elif kind == "update_stage":
+                        self._update_stage = payload[0]
+                        dlg = self._dialogs.get("settings")
+                        if dlg is not None and hasattr(dlg, "refresh_update_status"):
+                            dlg.refresh_update_status()
+                    elif kind == "update_done":
+                        self._log("更新已交接给新版进程, 退出")
+                        self.root.after(200, self.quit)
                 except Exception as exc:
                     # 单条消息处理失败(如某次渲染异常)不能拖垮整个轮询链
                     self._log("处理 %s 消息异常: %r" % (kind, exc))
@@ -1381,7 +1394,13 @@ class StockBar:
     def _show_menu(self, x: int, y: int):
         pal, F = self.pal, self.fonts
         pick_code = self._current_pick_code()
-        items = [
+        items = []
+        if self._update_info:
+            items.append({"type": "cmd", "accent": True,
+                          "label": "⬆ 发现新版本 %s（点击更新）" % self._update_info.get("tag", ""),
+                          "command": self.start_update})
+            items.append({"type": "sep"})
+        items += [
             {"type": "cmd", "label": "设置…", "shortcut": "Ctrl+,", "command": self.open_settings},
             {"type": "sep"},
             {"type": "cmd", "label": "管理自选股…", "shortcut": "Ctrl+M", "command": self.open_manage},
@@ -1626,9 +1645,94 @@ class StockBar:
                     pass
                 setattr(self, attr, None)
 
+    # ---------- 更新 ----------
+    def _start_update_check(self):
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        info = D.fetch_latest_release()
+        self._q.put(("update_check", info))
+
+    def _on_update_check(self, info):
+        """检查结果: 有新版本则记下, 菜单与设置里会出现更新入口。"""
+        if not info:
+            return
+        try:
+            newer = D.version_tuple(info.get("tag", "")) > D.version_tuple(APP_VERSION)
+        except Exception:
+            newer = False
+        if newer:
+            self._update_info = info
+            self._log("发现新版本 %s" % info.get("tag"))
+        dlg = self._dialogs.get("settings")
+        if dlg is not None and hasattr(dlg, "refresh_update_status"):
+            dlg.refresh_update_status()
+
+    def start_update(self):
+        """下载并安装新版本(会重启到新版)。"""
+        info = self._update_info
+        if not info or self._updating:
+            return
+        if not getattr(sys, "frozen", False):
+            self._update_stage = "源码运行模式不支持自动更新"
+            self._q.put(("update_stage", self._update_stage))
+            return
+        self._updating = True
+        self._update_stage = "准备下载…"
+        self._q.put(("update_stage", self._update_stage))
+        threading.Thread(target=self._update_worker, args=(info,), daemon=True).start()
+
+    def _update_worker(self, info):
+        import shutil
+        import tempfile
+        import zipfile
+        stage_root = os.path.join(tempfile.gettempdir(), "stockbar_update")
+        try:
+            shutil.rmtree(stage_root, ignore_errors=True)
+            os.makedirs(stage_root, exist_ok=True)
+            zip_path = os.path.join(stage_root, "update.zip")
+
+            def progress(done, total):
+                if total > 0:
+                    self._update_stage = "下载中 %d%%" % int(done * 100 / total)
+                else:
+                    self._update_stage = "下载中 %.1fMB" % (done / 1048576)
+
+            if not D.download_file(info["url"], zip_path, progress=progress):
+                raise RuntimeError("下载失败, 请检查网络")
+            self._update_stage = "校验并解压…"
+            self._q.put(("update_stage", self._update_stage))
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(stage_root)
+            staging = stage_root
+            for name in sorted(os.listdir(stage_root)):
+                p = os.path.join(stage_root, name)
+                if os.path.isdir(p) and any(f.lower().endswith(".exe") for f in os.listdir(p)):
+                    staging = p
+                    break
+            new_exe = None
+            for f in sorted(os.listdir(staging)):
+                if f.lower().endswith(".exe"):
+                    new_exe = os.path.join(staging, f)
+                    break
+            if not new_exe:
+                raise RuntimeError("安装包里没有可执行文件")
+            app_dir = getattr(self, "base_dir", "") or os.path.dirname(sys.executable)
+            old_exe = os.path.basename(sys.executable)
+            self._update_stage = "正在重启到新版本…"
+            self._q.put(("update_stage", self._update_stage))
+            subprocess.Popen([new_exe, "--apply-update", staging, app_dir, old_exe],
+                             cwd=staging, close_fds=True)
+            self._q.put(("update_done", None))
+        except Exception as exc:
+            self._updating = False
+            self._update_stage = "更新失败: %s" % exc
+            self._q.put(("update_stage", self._update_stage))
+
     def run(self):
         self._log(f"启动 v{APP_VERSION}, 自选 {len(self.pick_codes)} 只, 模式 {self.cfg['appearance']}")
         try:
+            self.root.after(3000, self._start_update_check)   # 启动后 3 秒静默检查更新
             self.root.mainloop()
         finally:
             self._stop.set()
@@ -1697,6 +1801,89 @@ def check_mode() -> int:
     return 0
 
 
+def apply_update_from_staging(staging: str, app_dir: str, old_exe: str) -> int:
+    """自举更新: 由"新 exe"从临时目录完成替换(运行中的 exe 不能覆盖自己)。
+
+    流程: 等旧 exe 退出 -> _internal 整体换新(带回滚) -> 复制其余文件(跳过 config.json)
+          -> 删除旧 exe -> 从原目录启动新版。
+    """
+    import shutil
+
+    log_path = os.path.join(app_dir, "update.log")
+
+    def log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+        except OSError:
+            pass
+
+    log("apply-update: staging=%s app=%s old=%s" % (staging, app_dir, old_exe))
+    if not (staging and app_dir and os.path.isdir(staging)):
+        log("参数无效")
+        return 1
+    # 1) 等旧 exe 退出(能改名即视为已退出)
+    old_path = os.path.join(app_dir, old_exe) if old_exe else ""
+    old_bak = (old_path + ".old") if old_path else ""
+    for i in range(60):
+        try:
+            if old_path and os.path.exists(old_path):
+                os.rename(old_path, old_bak)
+                log("旧 exe 已让位(等待 %d 秒)" % i)
+            break
+        except OSError:
+            time.sleep(1)
+    # 2) 覆盖 _internal(整体替换, 失败回滚), 其余文件直接复制
+    skip = {"config.json", "stock_bar.log", "stock_bar.lock", "update.log"}
+    new_exe = os.path.basename(sys.executable)
+    try:
+        for name in sorted(os.listdir(staging)):
+            if name in skip:
+                continue
+            src = os.path.join(staging, name)
+            dst = os.path.join(app_dir, name)
+            if os.path.isdir(src):
+                if name == "_internal":
+                    bak = dst + ".old"
+                    if os.path.isdir(dst):
+                        if os.path.isdir(bak):
+                            shutil.rmtree(bak, ignore_errors=True)
+                        os.rename(dst, bak)
+                    try:
+                        shutil.copytree(src, dst)
+                    except Exception:
+                        shutil.rmtree(dst, ignore_errors=True)
+                        if os.path.isdir(bak):
+                            os.rename(bak, dst)          # 回滚
+                        raise
+                    shutil.rmtree(bak, ignore_errors=True)
+                else:
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        log("文件替换完成")
+    except Exception as exc:
+        log("替换失败: %r" % exc)
+        if old_bak and os.path.exists(old_bak) and not os.path.exists(old_path):
+            os.rename(old_bak, old_path)                 # 回滚旧 exe
+        return 1
+    # 3) 从原目录启动新版, 清理旧 exe
+    target = os.path.join(app_dir, new_exe)
+    try:
+        subprocess.Popen([target], cwd=app_dir, close_fds=True)
+        log("已启动新版: %s" % target)
+    except Exception as exc:
+        log("启动新版失败: %r" % exc)
+        return 1
+    for junk in (old_bak,):
+        try:
+            if junk and os.path.exists(junk):
+                os.remove(junk)
+        except OSError:
+            pass
+    return 0
+
+
 def main() -> int:
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
@@ -1716,6 +1903,12 @@ def main() -> int:
         return 0 if ok else 1
     if "--check" in sys.argv:
         return check_mode()
+    if "--apply-update" in sys.argv:
+        i = sys.argv.index("--apply-update")
+        args = sys.argv[i + 1:i + 4]
+        return apply_update_from_staging(args[0] if args else "",
+                                         args[1] if len(args) > 1 else "",
+                                         args[2] if len(args) > 2 else "")
 
     enable_dpi_awareness()
     pid = _instance_pid()

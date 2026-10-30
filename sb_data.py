@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import socket
 import urllib.parse
 import urllib.request
@@ -19,6 +20,63 @@ QUOTE_URL = "https://qt.gtimg.cn/q={codes}"
 SINA_URL = "https://hq.sinajs.cn/list={codes}"
 MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}&_var=min_data"
 SEARCH_URL = "https://smartbox.gtimg.cn/s3/?q={kw}&t=all"
+RELEASES_API = "https://api.github.com/repos/gdy4803-maker/stock-bar/releases/latest"
+
+
+def version_tuple(text: str) -> tuple[int, int, int]:
+    """'v1.3.6' / '1.3.6' -> (1, 3, 6); 非数字段按 0 处理。"""
+    parts = []
+    for chunk in (text or "").lstrip("vV").split(".")[:3]:
+        num = ""
+        for ch in chunk:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num or 0))
+    while len(parts) < 3:
+        parts.append(0)
+    return parts[0], parts[1], parts[2]
+
+
+def fetch_latest_release(timeout: float = 10.0):
+    """查询 GitHub 最新 Release, 返回 {tag, url, size} 或 None(失败静默)。"""
+    try:
+        with urllib.request.urlopen(RELEASES_API, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = str(data.get("tag_name") or "")
+        for a in data.get("assets") or []:
+            name = str(a.get("name") or "")
+            if name.endswith("-win64.zip"):
+                url = a.get("browser_download_url")
+                if tag and url:
+                    return {"tag": tag, "url": url, "size": int(a.get("size") or 0)}
+    except Exception:
+        pass
+    return None
+
+
+def download_file(url: str, dest: str, timeout: float = 60.0, progress=None) -> bool:
+    """流式下载到 dest; progress(已下, 总量) 可选。失败返回 False。"""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        try:
+                            progress(done, total)
+                        except Exception:
+                            pass
+        return os.path.getsize(dest) > 0
+    except Exception:
+        return False
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -439,7 +439,8 @@ class MenuPopup(tk.Toplevel):
             if idx == self._hover:
                 draw_round_rect(c, 4 * self.scale, y1 + 2, w - 4 * self.scale, y2 - 2,
                                 7 * self.scale, self.pal["menu_hover"], "", 1)
-            color = self.pal["pos"] if it.get("danger") else self.pal["text"]
+            color = (self.pal["pos"] if it.get("danger")
+                     else self.pal["accent"] if it.get("accent") else self.pal["text"])
             x = self.pad + 10 * self.scale
             if it["type"] == "check":
                 if it.get("checked"):

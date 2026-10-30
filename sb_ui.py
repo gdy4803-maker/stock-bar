@@ -699,6 +699,7 @@ class SettingsWindow(BaseDialog):
         self._build_appearance(left)
         self._build_window(left)
         self._build_stocks(left)
+        self._build_update(left)
         self._build_support(left)
         self._build_repo(left)
         self._build_market(right)
@@ -831,6 +832,87 @@ class SettingsWindow(BaseDialog):
                      kind="primary", width=104, height=30, scale=self.S,
                      bg=pal["panel_alt"]).pack(side="right")
 
+    # ---- 更新 ----
+    def _build_update(self, parent):
+        pal, F, S = self.pal, self.fonts, self.S
+        sec = self.section(parent, "更新")
+        # 状态行: 版本 + 状态徽章(紧挨着)
+        r = tk.Frame(sec, bg=pal["panel_alt"])
+        r.pack(fill="x", pady=(2, 4))
+        holder = tk.Frame(r, bg=pal["panel_alt"], width=int(92 * S))
+        holder.pack(side="left", fill="y")
+        holder.pack_propagate(False)
+        tk.Label(holder, text="当前版本", bg=pal["panel_alt"], fg=pal["text_dim"],
+                 font=F.label(), anchor="w").pack(side="left", pady=6)
+        tk.Label(r, text="v" + self.app.version, bg=pal["panel_alt"], fg=pal["text"],
+                 font=F.num(0, True)).pack(side="left")
+        self._update_chip = tk.Label(r, text="", bg=pal["panel_alt"],
+                                     fg=pal["muted"], font=F.tiny())
+        self._update_chip.pack(side="left", padx=(10, 0))
+        r = self.row(sec, "检查更新")
+        CanvasButton(r, "立即检查", self._check_update_now, pal, F,
+                     kind="ghost", width=92, height=30, scale=S,
+                     bg=pal["panel_alt"]).pack(side="left")
+        self._update_btn = CanvasButton(r, "更新", self._do_update, pal, F,
+                                        kind="primary", width=92, height=30, scale=S,
+                                        bg=pal["panel_alt"])
+        self._btn_shown = False        # 「更新」按钮: 仅有新版本时出现
+        tk.Label(sec, text="自动重启到新版，配置不变", bg=pal["panel_alt"],
+                 fg=pal["faint"], font=F.tiny()).pack(
+            anchor="w", padx=int(104 * S), pady=(2, 10))
+        self.refresh_update_status()
+
+    def _update_status_text(self):
+        app = self.app
+        if getattr(app, "_updating", False):
+            return app._update_stage or "正在更新…"
+        info = getattr(app, "_update_info", None)
+        if info:
+            return "发现新版本 %s" % info.get("tag", "")
+        return "已是最新版本"
+
+    def refresh_update_status(self):
+        try:
+            text = self._update_status_text()
+            new = bool(getattr(self.app, "_update_info", None)) and not self.app._updating
+            self._update_chip.config(
+                text="  " + text + "  ",
+                fg=self.pal["accent"] if new else self.pal["muted"],
+                bg=self.pal["panel_alt"] if not new else self.pal["menu_hover"])
+            # 「更新」按钮: 仅有新版本时出现
+            if new and not self._btn_shown:
+                self._update_btn.pack(side="left", padx=(10, 0))
+                self._btn_shown = True
+            elif not new and self._btn_shown:
+                self._update_btn.pack_forget()
+                self._btn_shown = False
+        except Exception:
+            pass
+
+    def _check_update_now(self):
+        self._update_chip.config(text="  正在检查…  ")
+        import threading
+        threading.Thread(target=self._check_now_worker, daemon=True).start()
+
+    def _check_now_worker(self):
+        import sb_data as D
+        info = D.fetch_latest_release()
+        try:
+            self.app._on_update_check(info)
+        except Exception:
+            pass
+        try:
+            self.win.after(0, self.refresh_update_status)
+        except Exception:
+            pass
+
+    def _do_update(self):
+        if not getattr(self.app, "_update_info", None):
+            self.refresh_update_status()
+            return
+        self.app.start_update()
+        self.refresh_update_status()
+
     def _build_support(self, parent):
         pal, S = self.pal, self.S
         sec = self.section(parent, "支持开发者")
@@ -879,39 +961,40 @@ class SettingsWindow(BaseDialog):
         r = tk.Frame(sec, bg=pal["panel_alt"])
         r.pack(fill="x", pady=2)
         url = getattr(self.app, "repo_url", "") or "https://github.com/gdy4803-maker/stock-bar"
-        # 显示去掉协议前缀的短地址, 点击用完整 URL 打开
         short = url.split("://", 1)[-1]
-        lab = tk.Label(r, text=short, bg=pal["panel_alt"], fg=pal["accent"],
-                       font=self.fonts.label(), cursor="hand2", anchor="w")
-        lab.pack(side="left", fill="x", expand=True)
-        lab.bind("<Button-1>", lambda e: self._open_repo())
-        CanvasButton(r, "打开仓库", self._open_repo, pal, self.fonts,
+        self._repo_lab = tk.Label(r, text=short, bg=pal["panel_alt"], fg=pal["accent"],
+                                  font=self.fonts.label(), cursor="hand2", anchor="w")
+        self._repo_lab.pack(side="left", fill="x", expand=True)
+        self._repo_lab.bind("<Button-1>", lambda e: self._copy_repo())
+        CanvasButton(r, "复制仓库", self._copy_repo, pal, self.fonts,
                      kind="ghost", width=84, height=30, scale=self.S,
                      bg=pal["panel_alt"]).pack(side="right")
 
-    def _open_repo(self):
+    def _copy_repo(self):
+        """复制仓库地址到剪贴板(不再跳转浏览器)。"""
         url = getattr(self.app, "repo_url", "") or "https://github.com/gdy4803-maker/stock-bar"
-        # 打包成 exe 后 webbrowser 模块常失效, 优先用系统 ShellExecute 打开默认浏览器
-        opened = False
+        ok = False
+        for clip in (getattr(self.app, "input", None), self.win):
+            try:
+                clip.clipboard_clear()
+                clip.clipboard_append(url)
+                ok = True
+                break
+            except Exception:
+                continue
         try:
-            os.startfile(url)          # type: ignore[attr-defined]
-            opened = True
+            self._repo_lab.config(text=("已复制到剪贴板 ✓" if ok else "复制失败, 请手动复制"),
+                                  fg=(self.pal["pos"] if ok else self.pal["warn"]))
+            self.win.after(1500, self._restore_repo_label)
         except Exception:
-            try:
-                import webbrowser
-                opened = bool(webbrowser.open(url))
-            except Exception:
-                opened = False
-        if not opened:
-            try:
-                self.app.input.clipboard_clear()
-                self.app.input.clipboard_append(url)
-            except Exception:
-                pass
-            messagebox.showinfo(
-                "打开仓库",
-                "无法自动打开浏览器，链接已复制到剪贴板：\n\n" + url,
-                parent=self.win)
+            pass
+
+    def _restore_repo_label(self):
+        try:
+            url = getattr(self.app, "repo_url", "") or "https://github.com/gdy4803-maker/stock-bar"
+            self._repo_lab.config(text=url.split("://", 1)[-1], fg=self.pal["accent"])
+        except Exception:
+            pass
 
     # ---- 行情 ----
     def _build_market(self, parent):
