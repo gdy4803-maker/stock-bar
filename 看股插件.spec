@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='看股插件V1.3.5',
+    name='看股插件V1.3.6',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -1223,19 +1223,25 @@ class StockBar:
             while True:
                 kind, *payload = self._q.get_nowait()
                 self._last_msg_at = time.time()
-                if kind == "data":
-                    gen, quotes = payload
-                    if gen == self._gen:
-                        self._on_data(quotes)
-                elif kind == "error":
-                    gen = payload[0]
-                    if gen == self._gen:
-                        self._set_error(True)
-                elif kind == "minutes":
-                    code, series = payload
-                    self._on_minutes(code, series)
+                try:
+                    if kind == "data":
+                        gen, quotes = payload
+                        if gen == self._gen:
+                            self._on_data(quotes)
+                    elif kind == "error":
+                        gen = payload[0]
+                        if gen == self._gen:
+                            self._set_error(True)
+                    elif kind == "minutes":
+                        code, series = payload
+                        self._on_minutes(code, series)
+                except Exception as exc:
+                    # 单条消息处理失败(如某次渲染异常)不能拖垮整个轮询链
+                    self._log("处理 %s 消息异常: %r" % (kind, exc))
         except queue.Empty:
             pass
+        except Exception as exc:
+            self._log("轮询异常: %r" % exc)
         self._tick += 1
         # 嵌入任务栏时任务栏会把自己抬到最上层, 需要更频繁地压回去
         every = 3 if self.cfg.get("dock_taskbar") else 20

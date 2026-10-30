@@ -494,10 +494,13 @@ class MenuPopup(tk.Toplevel):
 
     def _open_sub(self, idx):
         self._sub_after = None
+        try:
+            if not self.winfo_exists():       # 菜单已销毁时 winfo_exists 自身会抛异常
+                return
+        except tk.TclError:
+            return
         self._outside_since = None      # 跨层移动: 重置离开计时, 避免误收
         self._hover_seen = True
-        if not self.winfo_exists():
-            return
         for child in list(self.submenus):
             self._close_child(child)
         it = self.items[idx]

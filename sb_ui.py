@@ -487,6 +487,19 @@ class InfoCard:
         if len(pts) > 180:
             step = len(pts) / 180.0
             pts = [pts[min(len(pts) - 1, int(i * step))] for i in range(180)]
+        if len(pts) < 2:
+            # 集合竞价/刚开盘只有 1 个点: 画一个点即可, 直接 create_line 会因坐标不足抛异常
+            if pts:
+                v = pts[0][1]
+                prev1 = q.prev_close or series.prev_close or v
+                lo1, hi1 = min(v, prev1), max(v, prev1)
+                if hi1 - lo1 < 1e-9:
+                    hi1, lo1 = lo1 + 0.01, lo1 - 0.01
+                py = y2 - (v - lo1) / (hi1 - lo1) * (y2 - y1)
+                px = (x1 + x2) / 2
+                c.create_oval(px - 3 * S, py - 3 * S, px + 3 * S, py + 3 * S,
+                              fill=color, outline="")
+            return
         prices = [v for _t, v in pts]
         prev = q.prev_close or series.prev_close or prices[0]
         lo = min(min(prices), prev)
