@@ -59,6 +59,7 @@ else:
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOG_PATH = os.path.join(BASE_DIR, "stock_bar.log")
 LOCK_PATH = os.path.join(BASE_DIR, "stock_bar.lock")
+UPDATE_CACHE = os.path.join(BASE_DIR, "update_cache.json")   # 更新检查结果缓存
 
 INTERVALS = (0.5, 1, 2, 3, 5, 10)
 
@@ -582,6 +583,7 @@ class StockBar:
         self._last_msg_at = time.time()      # 看门狗: 最近一次收到取数线程消息的时间
         self._update_info = None             # 发现的新版本 {tag,url,size}
         self._update_stage = ""              # 更新进度文案
+        self._update_check_state = ""        # "" 未检查 | ok 成功 | fail 失败(限流/网络)
         self._updating = False
         self._minute_cache: dict[str, tuple[float, D.MinuteSeries | None]] = {}
         self._minute_pending: set[str] = set()
@@ -1647,23 +1649,42 @@ class StockBar:
 
     # ---------- 更新 ----------
     def _start_update_check(self):
+        # 结果落盘缓存: 反复重启不再重复消耗 GitHub API 额度(60 次/小时)
+        try:
+            with open(UPDATE_CACHE, encoding="utf-8") as f:
+                cache = json.load(f)
+            if time.time() - float(cache.get("at", 0)) < 6 * 3600:
+                self._on_update_check(cache.get("info"))
+                return
+        except Exception:
+            pass
+        if time.time() - getattr(self, "_last_check_at", 0.0) < 1800:
+            return
         threading.Thread(target=self._check_update_worker, daemon=True).start()
 
     def _check_update_worker(self):
+        self._last_check_at = time.time()
         info = D.fetch_latest_release()
+        try:
+            with open(UPDATE_CACHE, "w", encoding="utf-8") as f:
+                json.dump({"at": time.time(), "info": info}, f, ensure_ascii=False)
+        except OSError:
+            pass
         self._q.put(("update_check", info))
 
     def _on_update_check(self, info):
         """检查结果: 有新版本则记下, 菜单与设置里会出现更新入口。"""
         if not info:
-            return
-        try:
-            newer = D.version_tuple(info.get("tag", "")) > D.version_tuple(APP_VERSION)
-        except Exception:
-            newer = False
-        if newer:
-            self._update_info = info
-            self._log("发现新版本 %s" % info.get("tag"))
+            self._update_check_state = "fail"       # 限流/网络失败: 不谎报"已是最新"
+        else:
+            self._update_check_state = "ok"
+            try:
+                newer = D.version_tuple(info.get("tag", "")) > D.version_tuple(APP_VERSION)
+            except Exception:
+                newer = False
+            if newer:
+                self._update_info = info
+                self._log("发现新版本 %s" % info.get("tag"))
         dlg = self._dialogs.get("settings")
         if dlg is not None and hasattr(dlg, "refresh_update_status"):
             dlg.refresh_update_status()

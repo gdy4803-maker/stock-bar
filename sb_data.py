@@ -20,7 +20,7 @@ QUOTE_URL = "https://qt.gtimg.cn/q={codes}"
 SINA_URL = "https://hq.sinajs.cn/list={codes}"
 MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}&_var=min_data"
 SEARCH_URL = "https://smartbox.gtimg.cn/s3/?q={kw}&t=all"
-RELEASES_API = "https://api.github.com/repos/gdy4803-maker/stock-bar/releases/latest"
+RELEASES_API = "https://api.github.com/repos/gdy4803-maker/stock-bar/releases?per_page=20"
 
 
 def version_tuple(text: str) -> tuple[int, int, int]:
@@ -40,17 +40,28 @@ def version_tuple(text: str) -> tuple[int, int, int]:
 
 
 def fetch_latest_release(timeout: float = 10.0):
-    """查询 GitHub 最新 Release, 返回 {tag, url, size} 或 None(失败静默)。"""
+    """查询 GitHub 最新 Release, 返回 {tag, url, size} 或 None(失败静默)。
+
+    用 releases 列表而非 /latest —— 后者不返回"预发布"版本。
+    """
     try:
         with urllib.request.urlopen(RELEASES_API, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        tag = str(data.get("tag_name") or "")
-        for a in data.get("assets") or []:
-            name = str(a.get("name") or "")
-            if name.endswith("-win64.zip"):
-                url = a.get("browser_download_url")
-                if tag and url:
-                    return {"tag": tag, "url": url, "size": int(a.get("size") or 0)}
+        best = None
+        for rel in (data if isinstance(data, list) else []):
+            if rel.get("draft"):
+                continue
+            tag = str(rel.get("tag_name") or "")
+            url = None
+            size = 0
+            for a in rel.get("assets") or []:
+                if str(a.get("name") or "").endswith("-win64.zip"):
+                    url = a.get("browser_download_url")
+                    size = int(a.get("size") or 0)
+                    break
+            if tag and url and (best is None or version_tuple(tag) > version_tuple(best["tag"])):
+                best = {"tag": tag, "url": url, "size": size}
+        return best
     except Exception:
         pass
     return None
@@ -388,11 +399,17 @@ def _fetch_tencent(codes, index_set, timeout: float) -> dict[str, Quote]:
             continue
         try:
             price_raw = fields[3] or "0"
+            price = _to_float(fields[3])
+            prev = _to_float(fields[4])
+            if price <= 0 or prev <= 0:
+                # 集合竞价/停牌时常返回 0 价或空价: 丢弃, 保留上一次有效行情
+                # (否则会出现 (0-昨收)/昨收 = -100% 的假跌幅)
+                continue
             result[code] = Quote(
                 code=code,
                 name=fields[1],
-                price=_to_float(fields[3]),
-                prev_close=_to_float(fields[4]),
+                price=price,
+                prev_close=prev,
                 open=_to_float(fields[5]),
                 high=_to_float(fields[33]),
                 low=_to_float(fields[34]),
@@ -438,17 +455,23 @@ def _fetch_sina(codes, index_set, timeout: float) -> dict[str, Quote]:
             continue
         try:
             price_raw = f[3] or "0"
+            price = _to_float(f[3])
+            prev = _to_float(f[2])
+            if price <= 0 or prev <= 0:
+                # 集合竞价/停牌时常返回 0 价或空价: 丢弃, 保留上一次有效行情
+                # (否则 (0-昨收)/昨收 会算出 -100% 的假跌幅)
+                continue
             stamp = (f[30].replace("-", "") + f[31].replace(":", ""))[:14]
             result[code] = Quote(
                 code=code,
                 name=f[0],
-                price=_to_float(f[3]),
-                prev_close=_to_float(f[2]),
+                price=price,
+                prev_close=prev,
                 open=_to_float(f[1]),
                 high=_to_float(f[4]),
                 low=_to_float(f[5]),
-                change=_round2(_to_float(f[3]) - _to_float(f[2])),
-                pct=_round2((_to_float(f[3]) / _to_float(f[2]) - 1) * 100 if _to_float(f[2]) else 0.0),
+                change=_round2(price - prev),
+                pct=_round2((price / prev - 1) * 100),
                 volume=_to_float(f[8]) / 100.0,        # 股 -> 手(对齐腾讯)
                 amount=_to_float(f[9]) / 10000.0,      # 元 -> 万元(对齐腾讯)
                 time=stamp,

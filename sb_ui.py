@@ -869,6 +869,8 @@ class SettingsWindow(BaseDialog):
         info = getattr(app, "_update_info", None)
         if info:
             return "发现新版本 %s" % info.get("tag", "")
+        if getattr(app, "_update_check_state", "") == "fail":
+            return "检查失败（限流/网络），稍后再试"
         return "已是最新版本"
 
     def refresh_update_status(self):
@@ -895,10 +897,9 @@ class SettingsWindow(BaseDialog):
         threading.Thread(target=self._check_now_worker, daemon=True).start()
 
     def _check_now_worker(self):
-        import sb_data as D
-        info = D.fetch_latest_release()
+        # 手动检查: 不受缓存限制, 结果也会写入缓存
         try:
-            self.app._on_update_check(info)
+            self.app._check_update_worker()
         except Exception:
             pass
         try:
