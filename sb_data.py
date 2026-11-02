@@ -613,16 +613,32 @@ def search_symbols(keyword: str, timeout: float = 8.0) -> list[Symbol]:
 
 
 # ---------------- 格式化 ----------------
+def _trim_zeros(text: str, min_frac: int) -> str:
+    """去掉无意义的尾随 0, 但至少保留 min_frac 位小数(不同行情源小数位不一致时统一观感)。"""
+    if "." not in text:
+        return text
+    int_part, frac = text.rsplit(".", 1)
+    frac = frac.rstrip("0")
+    if len(frac) < min_frac:
+        frac = frac.ljust(min_frac, "0")
+    return (int_part + "." + frac) if frac else int_part
+
+
 def fmt_price(value: float, dp: int = 2) -> str:
     try:
-        return "{:,.{dp}f}".format(float(value), dp=dp)
+        v = float(value)
+        s = "{:,.{dp}f}".format(v, dp=dp)
+        return _trim_zeros(s, 2 if abs(v) >= 1 else 3)
     except (TypeError, ValueError):
         return "--"
 
 
 def fmt_change(value: float, dp: int = 2) -> str:
     try:
-        return "{:+,.{dp}f}".format(float(value), dp=dp)
+        v = float(value)
+        s = "{:+,.{dp}f}".format(v, dp=dp)
+        sign = s[0] if s[:1] in "+-" else ""
+        return sign + _trim_zeros(s.lstrip("+-"), 2 if abs(v) >= 1 else 3)
     except (TypeError, ValueError):
         return "--"
 
