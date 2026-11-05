@@ -18,6 +18,17 @@ from sb_widgets import (CanvasButton, Segmented, SizeHandle, Slider, Switch,
                         make_entry, setup_ttk)
 
 
+def auction_phase(now=None) -> str:
+    """集合竞价阶段: auction=竞价中(9:15–9:25) | matched=已撮合待开盘(9:25–9:30) | ''=正常时段。"""
+    t = time.localtime(now or time.time())
+    mins = t.tm_hour * 60 + t.tm_min
+    if 9 * 60 + 15 <= mins < 9 * 60 + 25:
+        return "auction"
+    if 9 * 60 + 25 <= mins < 9 * 60 + 30:
+        return "matched"
+    return ""
+
+
 def _text_run(canvas, x, y, parts, anchor="w"):
     """按顺序绘制多段不同颜色/字体的文字, 返回结束 x。"""
     if anchor == "e":
@@ -190,7 +201,8 @@ class InfoCard:
             price = q.price if q else 0.0
             fv = ((price - pos.avg_cost) * pos.lots * 100
                   if (q and pos.lots > 0 and pos.avg_cost > 0) else None)
-            dv = D.day_pnl_of(h.get("trades"), price, q.prev_close) if q else None
+            dv = (D.day_pnl_of(h.get("trades"), price, q.prev_close, quote_time=q.time)
+                  if q else None)
             mv += price * pos.lots * 100
             day += dv or 0.0
             fl += fv or 0.0
@@ -376,9 +388,14 @@ class InfoCard:
         # 分时图(简洁模式不显示)
         if not p["simple"]:
             self._draw_chart(c, p, q, color, soft)
-            c.create_text(pad, p["time"] + 4 * S, text=self._first_time(), anchor="w",
+            phase = auction_phase()
+            if phase:
+                t1, t2 = ("09:15", "09:25")
+            else:
+                t1, t2 = self._first_time(), self._last_time()
+            c.create_text(pad, p["time"] + 4 * S, text=t1, anchor="w",
                           fill=pal["faint"], font=fonts.tiny())
-            c.create_text(w - pad, p["time"] + 4 * S, text=self._last_time(), anchor="e",
+            c.create_text(w - pad, p["time"] + 4 * S, text=t2, anchor="e",
                           fill=pal["faint"], font=fonts.tiny())
 
         # 数据网格
@@ -408,7 +425,7 @@ class InfoCard:
             mv = q.price * shares
             dpnl = D.day_pnl_of(
                 (self.app.cfg.get("holdings", {}).get(q.code) or {}).get("trades"),
-                q.price, q.prev_close)
+                q.price, q.prev_close, quote_time=q.time)
             left = [("持仓 ", fonts.label(), pal["muted"]),
                     (f"{lots}手", fonts.label(), pal["text_dim"])]
             if hold.avg_cost > 0:
@@ -460,7 +477,105 @@ class InfoCard:
             return self.series.points[-1][0]
         return ""
 
+    def _draw_auction(self, c, p, q, color, soft):
+        """集合竞价走势图: 虚拟撮合价曲线 + 每段涨跌红绿柱 + 昨收参考线;
+        9:25 撮合后补上真实的竞价成交量柱。"""
+        S = self.app.scale * 0.875
+        pal = self.app.pal
+        fonts = self.app.card_fonts
+        pad = p["pad"]
+        w = p["w"]
+        x1, x2 = pad + 4 * S, w - pad - 4 * S
+        y1 = p["chart"]
+        y2 = p["chart"] + int(64 * S)
+        phase = auction_phase()
+        today = time.strftime("%Y%m%d")
+        samples = [(t, v) for t, v in (getattr(self.app, "_auction", {}) or {}).get(q.code, [])
+                   if str(t)[:8] == today and v > 0]
+        prev = q.prev_close or (samples[0][1] if samples else 0.0)
+
+        # 无采样: 提示等待
+        if not samples:
+            c.create_text((x1 + x2) / 2, (y1 + y2) / 2, text="集合竞价采样中…",
+                          fill=pal["faint"], font=fonts.label())
+            return
+
+        prices = [v for _t, v in samples]
+        lo = min(min(prices), prev)
+        hi = max(max(prices), prev)
+        if hi - lo < 1e-9:
+            hi, lo = lo + 0.01, lo - 0.01
+        span = (hi - lo) * 1.12
+        mid = (hi + lo) / 2
+        lo, hi = mid - span / 2, mid + span / 2
+
+        # 布局: 图区底部是红绿柱状带, 上方是撮合价曲线
+        band_h = int((y2 - y1) * 0.34)
+        band_top = y2 - band_h
+
+        # 昨收参考虚线
+        py_prev = band_top - (prev - lo) / (hi - lo) * (band_top - y1)
+        c.create_line(x1, py_prev, x2, py_prev, fill=pal["border"], dash=(3, 3))
+
+        # 每段涨跌红绿柱(底部柱状带: 红=该段上涨, 绿=该段下跌)
+        n_seg = 24
+        seg_vals = []
+        for i in range(n_seg):
+            a = int(i * len(prices) / n_seg)
+            b = max(a + 1, int((i + 1) * len(prices) / n_seg))
+            b = min(b, len(prices))
+            seg_vals.append(prices[a:b])
+        deltas = [seg[-1] - seg[0] for seg in seg_vals if len(seg) >= 2]
+        max_d = max([abs(d) for d in deltas] or [1e-9])
+        bar_w = max(3, int((x2 - x1) / n_seg * 0.6))
+        for i, seg in enumerate(seg_vals):
+            if len(seg) < 2:
+                continue
+            delta = seg[-1] - seg[0]
+            cx = x1 + (x2 - x1) * (i + 0.5) / n_seg
+            hgt = max(3.0, abs(delta) / max_d * band_h)
+            hgt = min(hgt, band_h)
+            col = pal["pos"] if delta >= 0 else pal["neg"]
+            c.create_rectangle(cx - bar_w / 2, y2 - hgt, cx + bar_w / 2, y2,
+                               fill=col, outline="")
+
+        # 撮合价曲线(画在柱状带上方)
+        n = len(prices)
+        coords = []
+        for i, v in enumerate(prices):
+            px = x1 + (x2 - x1) * (i / max(1, n - 1))
+            py = band_top - (v - lo) / (hi - lo) * (band_top - y1)
+            coords += [px, py]
+        if len(coords) >= 4:
+            c.create_line(*coords, fill=color, width=max(1, int(1.6 * S)))
+        c.create_oval(coords[-2] - 2.6 * S, coords[-1] - 2.6 * S,
+                      coords[-2] + 2.6 * S, coords[-1] + 2.6 * S,
+                      fill=color, outline=pal["card_bg"])
+
+        # 标注
+        c.create_text(x1, y1 - int(13 * S),
+                      text="集合竞价 09:15–09:25", anchor="w",
+                      fill=pal["muted"], font=fonts.tiny())
+        c.create_text(x2, y1 - int(13 * S),
+                      text=("撮合价 %s" % D.fmt_price(prices[-1], q.dp)),
+                      anchor="e", fill=color, font=fonts.num(-3, True))
+
+        # 9:25 撮合后: 补真实的竞价成交量柱
+        if phase == "matched" and q.volume > 0:
+            bw = int((x2 - x1) * 0.10)
+            cx = (x1 + x2) / 2
+            hgt = int((y2 - y1) * 0.5)
+            col = pal["pos"] if prices[-1] >= prev else pal["neg"]
+            c.create_rectangle(cx - bw / 2, y2 - hgt, cx + bw / 2, y2,
+                               fill=col, outline="")
+            c.create_text(cx, y2 - hgt - int(9 * S),
+                          text="竞价成交 %s手" % D.fmt_volume(q.volume),
+                          anchor="s", fill=pal["text_dim"], font=fonts.tiny())
+
     def _draw_chart(self, c, p, q, color, soft):
+        if auction_phase():
+            self._draw_auction(c, p, q, color, soft)      # 竞价时段: 显示竞价走势图
+            return
         pal = self.app.pal
         fonts = self.app.card_fonts
         S = self.app.scale * 0.875
@@ -1850,7 +1965,7 @@ class HoldingsWindow(BaseDialog):
         if q and pos.lots > 0:
             shares = pos.lots * 100
             fv = (q.price - pos.avg_cost) * shares if pos.avg_cost > 0 else None
-            day = D.day_pnl_of(trades, q.price, q.prev_close)
+            day = D.day_pnl_of(trades, q.price, q.prev_close, quote_time=q.time)
             ref = fv if fv is not None else day
             tag = "up" if ref > 0 else ("down" if ref < 0 else "flat")
             values = (name, D.code_digits(code), price, str(pos.lots),
@@ -1859,7 +1974,8 @@ class HoldingsWindow(BaseDialog):
                       D.fmt_money_signed(day), realized)
         elif abs(pos.realized) > 0.004 or D.sold_today(trades):
             # 已清仓: 显示历史已实现盈亏; 今日清仓的还要显示今天的盈亏
-            day = D.day_pnl_of(trades, q.price, q.prev_close) if q else None
+            day = (D.day_pnl_of(trades, q.price, q.prev_close, quote_time=q.time)
+                   if q else None)
             day_txt = D.fmt_money_signed(day) if (day is not None and abs(day) > 0.004) else "-"
             values = (name, D.code_digits(code), price, "0", "-", "-", day_txt, realized)
             tag = "up" if pos.realized > 0 else "down"

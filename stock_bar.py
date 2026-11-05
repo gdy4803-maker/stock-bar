@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.3.10"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -581,6 +581,7 @@ class StockBar:
         self._worker: threading.Thread | None = None
         self._gen = 0
         self._last_msg_at = time.time()      # 看门狗: 最近一次收到取数线程消息的时间
+        self._auction: dict[str, list] = {}  # 集合竞价采样 {code: [(时间戳, 虚拟撮合价), ...]}
         self._update_info = None             # 发现的新版本 {tag,url,size}
         self._update_stage = ""              # 更新进度文案
         self._update_check_state = ""        # "" 未检查 | ok 成功 | fail 失败(限流/网络)
@@ -1269,6 +1270,7 @@ class StockBar:
 
     def _on_data(self, quotes: dict):
         self.quotes.update(quotes)
+        self._collect_auction(quotes)
         if self._error:
             self._error = False
         now = time.time()
@@ -1351,8 +1353,30 @@ class StockBar:
             pos, _ = D.position_of(h.get("trades"))
             if pos.lots <= 0 and not D.sold_today(h.get("trades")):
                 continue                 # 今日清仓也计入(今天亏的钱就是今天的)
-            total += D.day_pnl_of(h.get("trades"), q.price, q.prev_close)
+            total += D.day_pnl_of(h.get("trades"), q.price, q.prev_close, quote_time=q.time)
         return total
+
+    def _collect_auction(self, quotes: dict):
+        """集合竞价(9:15–9:25)采样虚拟撮合价 —— 复用行情轮询, 不额外请求网络。
+
+        竞价期间接口的现价就是"虚拟撮合价"(实测有效), 每次行情刷新顺手记一点,
+        累积起来就是竞价走势图的数据源。
+        """
+        t = time.localtime()
+        mins = t.tm_hour * 60 + t.tm_min
+        if not (9 * 60 + 15 <= mins < 9 * 60 + 25):
+            return
+        today = time.strftime("%Y%m%d")
+        for code, q in quotes.items():
+            if not q or q.price <= 0 or str(q.time)[:8] != today:
+                continue
+            arr = self._auction.setdefault(code, [])
+            if arr and arr[-1][0] == q.time:
+                arr[-1] = (q.time, q.price)      # 同一时间戳: 覆盖为最新
+            else:
+                arr.append((q.time, q.price))
+            if len(arr) > 800:                   # 上限保护(10 分钟足够)
+                del arr[:len(arr) - 800]
 
     def _pnl_display_value(self):
         """持仓段显示值: 按设置返回涨幅(%)或当日盈亏(元)。"""
@@ -1612,7 +1636,8 @@ class StockBar:
             if h and not q.is_index:
                 pos, _ = D.position_of(h.get("trades"))
                 if pos.lots > 0:
-                    dpnl = D.day_pnl_of(h.get("trades"), q.price, q.prev_close)
+                    dpnl = D.day_pnl_of(h.get("trades"), q.price, q.prev_close,
+                                        quote_time=q.time)
                     lines.append(f"    持仓 {pos.lots}手  当日盈亏 {D.fmt_money_signed(dpnl)}")
         try:
             self.input.clipboard_clear()

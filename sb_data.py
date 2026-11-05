@@ -305,7 +305,8 @@ def position_of(trades):
     return pos, rows
 
 
-def day_pnl_of(trades, price: float, prev_close: float, today: str = "") -> float:
+def day_pnl_of(trades, price: float, prev_close: float, today: str = "",
+               quote_time: str = "") -> float:
     """今日盈亏(元) —— 每一份股数都有"参考价", 离场/持有都结算:
 
     参考价: 昨日就有的股数 → 昨收; 今天买入的股数 → 买入价
@@ -313,8 +314,13 @@ def day_pnl_of(trades, price: float, prev_close: float, today: str = "") -> floa
 
     今日成交按时间顺序 FIFO: 卖出先消耗最老的份额并按其参考价当场结算,
     所以"买入后卖出""清仓"当天同样有今日盈亏。超卖部分忽略(与持仓推导一致)。
+
+    quote_time(YYYYMMDDHHMMSS): 行情时间戳; 若不是当天的行情(9 点前接口给的
+    还是昨天的数据)则今日盈亏记 0 —— 否则昨天的涨跌会被算进今天。
     """
     today = today or _dt.date.today().isoformat()
+    if quote_time and str(quote_time)[:8] != today.replace("-", ""):
+        return 0.0
     items = [t for t in (trades or []) if isinstance(t, dict)]
     # 1) 今日之前的成交 -> 昨收时的持仓, 作为"老仓"份额(参考价=昨收)
     prior = [t for t in items if str(t.get("time", ""))[:10] < today]
