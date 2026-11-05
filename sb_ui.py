@@ -1688,7 +1688,6 @@ class HoldingsWindow(BaseDialog):
         self.holdings = {c: {"trades": list(h.get("trades") or [])}
                          for c, h in (app.cfg.get("holdings") or {}).items()
                          if isinstance(h, dict)}
-        self._fee_dirty = False
         self.min_list = int(self.MIN_LIST * self.S)
         lay_top = int(self._lay.get("h_top") or 0)
         lay_log = int(self._lay.get("h_log") or 0)
@@ -1781,8 +1780,8 @@ class HoldingsWindow(BaseDialog):
 
         self.price_var, self.price_entry = field(0, "价格")
         self.lots_var, self.lots_entry = field(1, "数量(手)")
-        self.fee_var, self.fee_entry = field(2, "费用")
-        self.note_var, self.note_entry = field(3, "备注", numeric=False)
+        self.note_var, self.note_entry = field(2, "备注", numeric=False)
+        self.fee_var = None            # 费用按设置费率自动计算, 不再手工填写
 
         btns = tk.Frame(trade, bg=pal["panel_alt"])
         btns.pack(fill="x", padx=14, pady=(6, 12))
@@ -1796,11 +1795,8 @@ class HoldingsWindow(BaseDialog):
         tk.Label(btns, text="回车 = 买入", bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="right", padx=(0, 2))
 
-        for w in (self.price_entry, self.lots_entry, self.fee_entry, self.note_entry):
+        for w in (self.price_entry, self.lots_entry, self.note_entry):
             w.bind("<Return>", lambda e: self._trade("buy"))
-        for w in (self.price_entry, self.lots_entry):
-            w.bind("<KeyRelease>", lambda e: self._auto_fee())
-        self.fee_entry.bind("<Key>", lambda e: setattr(self, "_fee_dirty", True))
 
         # ---- 成交记录(高度可调) ----
         self.log_box = tk.Frame(body, bg=pal["panel"])
@@ -1948,7 +1944,7 @@ class HoldingsWindow(BaseDialog):
 
     def _set_state(self, enabled):
         state = "normal" if enabled else "disabled"
-        for w in (self.price_entry, self.lots_entry, self.fee_entry, self.note_entry):
+        for w in (self.price_entry, self.lots_entry, self.note_entry):
             w.config(state=state)
         if not enabled:
             self.sel_label.config(text="在上方选择一只股票后交易")
@@ -2074,18 +2070,6 @@ class HoldingsWindow(BaseDialog):
             text=(f"现价 {D.fmt_price(q.price, q.dp)}   可卖 {pos.lots} 手   "
                   f"{'成本 ' + D.fmt_price(pos.avg_cost, q.dp) if pos.avg_cost > 0 else ''}"))
         self._set_state(True)
-        self._auto_fee()
-
-    def _auto_fee(self):
-        if self._fee_dirty or not self.selected:
-            return
-        try:
-            price = float(self.price_var.get() or 0)
-            lots = int(float(self.lots_var.get() or 0))
-        except ValueError:
-            return
-        fee = D.trade_fee(self.selected, "buy", price, lots, self.app.cfg.get("fees"))
-        self.fee_var.set(("%.2f" % fee).rstrip("0").rstrip(".") if fee else "")
 
     def _read_form(self):
         code = self.selected
@@ -2101,24 +2085,19 @@ class HoldingsWindow(BaseDialog):
         if price <= 0 or lots <= 0:
             self.status.config(text="价格与数量必须大于 0")
             return None
-        try:
-            fee = float(self.fee_var.get() or 0)
-        except ValueError:
-            fee = D.trade_fee(code, "buy", price, lots, self.app.cfg.get("fees"))
-        return code, price, lots, max(0.0, fee), self.note_var.get().strip()[:40]
+        return code, price, lots, self.note_var.get().strip()[:40]
 
     def _trade(self, side):
         data = self._read_form()
         if not data:
             return
-        code, price, lots, fee, note = data
+        code, price, lots, note = data
         pos = self._pos(code)
         if side == "sell" and lots > pos.lots:
             self.status.config(text=f"可卖不足: 当前持仓 {pos.lots} 手")
             return
-        if not self._fee_dirty and side == "sell":
-            fee = D.trade_fee(code, "sell", price, lots, self.app.cfg.get("fees"))
-            self.fee_var.set("%.2f" % fee)
+        # 费用按设置费率自动计算: 股票用股票费率、ETF 用 ETF 费率(含卖出印花税)
+        fee = D.trade_fee(code, side, price, lots, self.app.cfg.get("fees"))
         trade = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "side": side,
                  "price": round(price, 4), "lots": lots,
                  "fee": round(fee, 2), "note": note}
@@ -2138,7 +2117,6 @@ class HoldingsWindow(BaseDialog):
             self.status.config(text="当前无持仓可卖")
             return
         self.lots_var.set(str(pos.lots))
-        self._fee_dirty = False
         self._trade("sell")
 
     def _del_trade(self):
