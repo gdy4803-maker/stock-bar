@@ -763,7 +763,7 @@ class StockBar:
 
     def _pct_of(self, code: str) -> float | None:
         q = self.quotes.get(code)
-        return q.pct if q else None
+        return D.today_pct(q)
 
     def _bar_parts(self):
         pal, F, S = self._text_palette(), self.fonts, self.scale
@@ -777,10 +777,10 @@ class StockBar:
             parts.append({"text": text, "font": font, "color": color,
                           "gap": gap * S, "kind": kind})
 
-        pick_pct = pick.pct if pick else None
+        pick_pct = D.today_pct(pick)
         pick_color = self._flash_color("pick", self._color(pick_pct, pal), pal)
         pick_text = D.fmt_pct(pick_pct)
-        idx_pct = idx.pct if idx else None
+        idx_pct = D.today_pct(idx)
         idx_color = self._flash_color("index", self._color(idx_pct, pal), pal)
         idx_text = D.fmt_pct(idx_pct)
         pnl_color = self._flash_color("pnl", self._color(pnl, pal), pal)
@@ -1080,8 +1080,15 @@ class StockBar:
             self.cfg["window_pos"] = {"x": self._x, "y": self._y}
             self.save_config()
             self._restack_bar()
-        elif event.x_root - self._x < (self._index_zone_left or self._w):
-            self._switch(1)
+        elif True:
+            # 分区点击: 个股段=切换股票 | 持仓段=切换 涨幅/金额 | 指数段=无
+            rel = event.x_root - self._x
+            idx_left = self._index_zone_left or self._w
+            pnl_left = self._zone_pnl_left
+            if pnl_left is not None and pnl_left <= rel < idx_left:
+                self._toggle_pnl_display()
+            elif rel < (pnl_left or idx_left):
+                self._switch(1)
 
     def _on_menu(self, event):
         self._hide_card()
@@ -1095,6 +1102,14 @@ class StockBar:
         self._flash["pick"] = time.time() + 0.28
         self._render_bar(force=True)
         self.root.after(320, lambda: self._render_bar(force=True))
+
+    def _toggle_pnl_display(self):
+        """点击持仓段: 切换 涨幅 / 金额 显示。"""
+        cur = self.cfg.get("pnl_display", "money")
+        self.cfg["pnl_display"] = "pct" if cur != "pct" else "money"
+        self._flash["pnl"] = time.time() + 0.28
+        self._render_bar(force=True)
+        self.save_config()
 
     def _select_pick(self, code: str):
         if code in self.pick_codes:
@@ -1325,16 +1340,16 @@ class StockBar:
         for code in codes:
             h = holdings.get(code)
             q = self.quotes.get(code)
-            if not h or not q:
-                continue
+            if not h or not q or not D.quote_is_today(q):
+                continue                 # 行情非当日(9 点前): 不计, 与今日盈亏口径一致
             pos, _ = D.position_of(h.get("trades"))
-            if pos.lots <= 0:
+            if pos.lots <= 0 and not D.sold_today(h.get("trades")):
                 continue
             shares = pos.lots * 100
             total_pnl += (q.price - q.prev_close) * shares
             total_base += q.prev_close * shares
         if not total_base:
-            return None
+            return 0.0                   # 今日未开始/无持仓: 0, 与今日盈亏口径一致
         return total_pnl / total_base * 100.0
 
     def _total_day_pnl(self):
@@ -1357,10 +1372,12 @@ class StockBar:
         return total
 
     def _collect_auction(self, quotes: dict):
-        """集合竞价(9:15–9:25)采样虚拟撮合价 —— 复用行情轮询, 不额外请求网络。
+        """集合竞价(9:15–9:25)采样 —— 复用行情轮询, 不额外请求网络。
 
-        竞价期间接口的现价就是"虚拟撮合价"(实测有效), 每次行情刷新顺手记一点,
-        累积起来就是竞价走势图的数据源。
+        竞价期间接口给的(实测):
+          现价 = 虚拟撮合价; 买一量 = 虚拟撮合量;
+          买二量/卖二量 = 撮合后未成交的买/卖余量(多空力量对比)。
+        每次行情刷新顺手记一点, 累积起来就是竞价走势图的数据源。
         """
         t = time.localtime()
         mins = t.tm_hour * 60 + t.tm_min
@@ -1370,12 +1387,14 @@ class StockBar:
         for code, q in quotes.items():
             if not q or q.price <= 0 or str(q.time)[:8] != today:
                 continue
+            rec = (q.time, q.price, float(q.bid1_vol or 0),
+                   float(q.buy_rest or 0), float(q.sell_rest or 0))
             arr = self._auction.setdefault(code, [])
             if arr and arr[-1][0] == q.time:
-                arr[-1] = (q.time, q.price)      # 同一时间戳: 覆盖为最新
+                arr[-1] = rec                 # 同一时间戳: 覆盖为最新
             else:
-                arr.append((q.time, q.price))
-            if len(arr) > 800:                   # 上限保护(10 分钟足够)
+                arr.append(rec)
+            if len(arr) > 800:                # 上限保护(10 分钟足够)
                 del arr[:len(arr) - 800]
 
     def _pnl_display_value(self):
@@ -1437,7 +1456,7 @@ class StockBar:
             q = self.quotes.get(code)
             label = _short_name(q.name, 6) if q else D.code_digits(code)
             if q:
-                label += "  " + D.fmt_pct(q.pct)
+                label += "  " + D.fmt_pct(D.today_pct(q))
             stock_items.append({"type": "check", "label": label, "checked": code == pick_code,
                                 "checked_fn": (lambda c=code: c == self._current_pick_code()),
                                 "command": lambda c=code: self._select_pick(c)})
@@ -1631,7 +1650,8 @@ class StockBar:
             if not q:
                 continue
             lines.append(f"{q.name}({D.code_digits(code)}) {D.fmt_price(q.price, q.dp)} "
-                         f"{D.fmt_change(q.change, q.dp)} {D.fmt_pct(q.pct)}")
+                         f"{D.fmt_change(q.change if D.quote_is_today(q) else 0.0, q.dp)} "
+                         f"{D.fmt_pct(D.today_pct(q))}")
             h = self.cfg.get("holdings", {}).get(code)
             if h and not q.is_index:
                 pos, _ = D.position_of(h.get("trades"))

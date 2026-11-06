@@ -124,6 +124,10 @@ class Quote:
     time: str              # YYYYMMDDHHMMSS
     dp: int = 2            # 价格小数位
     is_index: bool = False
+    bid1_vol: float = 0.0  # 买一量(集合竞价时 = 虚拟撮合量)
+    ask1_vol: float = 0.0  # 卖一量
+    buy_rest: float = 0.0  # 买余量(集合竞价: 撮合后未成交的买单)
+    sell_rest: float = 0.0 # 卖余量(集合竞价: 撮合后未成交的卖单)
 
 
 @dataclass(slots=True)
@@ -219,9 +223,13 @@ DEFAULT_FEES = {
 
 
 def is_fund(code: str) -> bool:
-    """ETF / LOF 等场内基金(按代码段判断)。"""
+    """ETF / LOF 等场内基金(按代码段判断)。
+
+    上交所: 50(封基/LOF) 51(ETF/LOF) 52(ETF 新段, 如 520920) 56(ETF) 58(LOF)
+    深交所: 15(基金/ETF) 16(LOF) 18(封基)
+    """
     c = code[2:] if len(code) > 2 else code
-    return c.startswith(("51", "56", "58", "159", "16"))
+    return c.startswith(("50", "51", "52", "56", "58", "15", "16", "18"))
 
 
 def trade_fee(code: str, side: str, price: float, lots: int, fees=None) -> float:
@@ -375,6 +383,22 @@ def sold_today(trades, today: str = "") -> bool:
     return False
 
 
+def quote_is_today(q, today: str = "") -> bool:
+    """行情是否为当天数据(9 点前接口给的还是昨天的行情)。"""
+    today = (today or _dt.date.today().isoformat()).replace("-", "")
+    return str(getattr(q, "time", ""))[:8] == today
+
+
+def today_pct(q):
+    """今日涨跌幅(%): 行情不是当天的(9 点前)按 0 计 —— 与今日盈亏口径一致,
+    避免"今日盈亏 0 但涨幅是昨天的"这种不一致。"""
+    if q is None:
+        return None
+    if not quote_is_today(q):
+        return 0.0
+    return q.pct
+
+
 def _price_dp(raw: str) -> int:
     raw = (raw or "").strip()
     if "." in raw:
@@ -426,6 +450,10 @@ def _fetch_tencent(codes, index_set, timeout: float) -> dict[str, Quote]:
                 time=fields[30],
                 dp=_price_dp(price_raw),
                 is_index=code in index_set,
+                bid1_vol=_to_float(fields[10]) if len(fields) > 20 else 0.0,
+                ask1_vol=_to_float(fields[20]) if len(fields) > 20 else 0.0,
+                buy_rest=_to_float(fields[12]) if len(fields) > 22 else 0.0,
+                sell_rest=_to_float(fields[22]) if len(fields) > 22 else 0.0,
             )
         except (IndexError, ValueError):
             continue

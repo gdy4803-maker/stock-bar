@@ -41,27 +41,40 @@ def _text_run(canvas, x, y, parts, anchor="w"):
 
 
 def _load_support_photo(app, name="support.png", target=None):
-    """加载赞赏码图片; 支持源码目录与 PyInstaller 的 _MEIPASS。"""
-    candidates = []
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(os.path.join(meipass, "assets", name))
-    base = getattr(app, "base_dir", "")
-    if base:
-        candidates.append(os.path.join(base, "assets", name))
-    for path in candidates:
-        if not os.path.exists(path):
-            continue
-        try:
-            photo = tk.PhotoImage(file=path)
-        except tk.TclError:
-            continue
-        if target:
-            factor = max(1, int(round(photo.width() / float(target))))
-            if factor > 1:
-                photo = photo.subsample(factor, factor)
-        return photo
-    return None
+    """加载赞赏码图片: 优先用内嵌 base64(不依赖外部文件), 找不到才退回 assets/。
+
+    深色主题自动用反色版(白色码点), 跟随界面背景。
+    """
+    photo = None
+    try:
+        import sb_support_img
+        inverted = (getattr(app, "pal", {}).get("name", "") == "dark")
+        photo = sb_support_img.get_photo(inverted=inverted)
+    except Exception:
+        photo = None
+    if photo is None:                     # 兼容: 退回外部图片文件
+        candidates = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, "assets", name))
+        base = getattr(app, "base_dir", "")
+        if base:
+            candidates.append(os.path.join(base, "assets", name))
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                photo = tk.PhotoImage(file=path)
+            except tk.TclError:
+                continue
+            break
+    if photo is None:
+        return None
+    if target:
+        factor = max(1, int(round(photo.width() / float(target))))
+        if factor > 1:
+            photo = photo.subsample(factor, factor)
+    return photo
 
 
 class InfoCard:
@@ -367,9 +380,11 @@ class InfoCard:
         c.create_text(w - pad - badge_w / 2, y + 10 * S, text=market,
                       fill=pal["text_dim"], font=fonts.tiny())
 
-        # 现价 + 涨跌 chip
+        # 现价 + 涨跌 chip(行情非当日时, 涨跌按 0 显示, 与今日盈亏口径一致)
         y = p["price"]
-        color = D.change_color(q.pct, pal)
+        pct = D.today_pct(q)
+        chg = q.change if D.quote_is_today(q) else 0.0
+        color = D.change_color(pct, pal)
         price_txt = D.fmt_price(q.price, q.dp)
         c.create_text(pad, y, text=price_txt, anchor="nw", fill=pal["text"],
                       font=fonts.card_price())
@@ -377,12 +392,12 @@ class InfoCard:
         chip_x = pad + price_w + 12 * S
         chip_w = 118 * S
         chip_h = 26 * S
-        soft = pal["pos_soft"] if q.pct > 0 else (pal["neg_soft"] if q.pct < 0 else pal["panel_alt"])
+        soft = pal["pos_soft"] if pct > 0 else (pal["neg_soft"] if pct < 0 else pal["panel_alt"])
         draw_round_rect(c, chip_x, y + 2 * S, chip_x + chip_w, y + 2 * S + chip_h, 7 * S,
                         soft, "", 1)
-        c.create_text(chip_x + 10 * S, y + 2 * S + chip_h / 2, text=D.fmt_change(q.change, q.dp),
+        c.create_text(chip_x + 10 * S, y + 2 * S + chip_h / 2, text=D.fmt_change(chg, q.dp),
                       anchor="w", fill=color, font=fonts.num(-2, True))
-        c.create_text(chip_x + chip_w - 10 * S, y + 2 * S + chip_h / 2, text=D.fmt_pct(q.pct),
+        c.create_text(chip_x + chip_w - 10 * S, y + 2 * S + chip_h / 2, text=D.fmt_pct(pct),
                       anchor="e", fill=color, font=fonts.num(-2, True))
 
         # 分时图(简洁模式不显示)
@@ -478,7 +493,9 @@ class InfoCard:
         return ""
 
     def _draw_auction(self, c, p, q, color, soft):
-        """集合竞价走势图: 虚拟撮合价曲线 + 每段涨跌红绿柱 + 昨收参考线;
+        """集合竞价走势图(数据驱动):
+        - 上方: 虚拟撮合价曲线 + 昨收参考线
+        - 下方: 量柱 = 虚拟撮合量, 颜色 = 买卖余量对比(红=买压, 绿=卖压)
         9:25 撮合后补上真实的竞价成交量柱。"""
         S = self.app.scale * 0.875
         pal = self.app.pal
@@ -490,8 +507,8 @@ class InfoCard:
         y2 = p["chart"] + int(64 * S)
         phase = auction_phase()
         today = time.strftime("%Y%m%d")
-        samples = [(t, v) for t, v in (getattr(self.app, "_auction", {}) or {}).get(q.code, [])
-                   if str(t)[:8] == today and v > 0]
+        raw = (getattr(self.app, "_auction", {}) or {}).get(q.code, [])
+        samples = [s for s in raw if str(s[0])[:8] == today and s[1] > 0]
         prev = q.prev_close or (samples[0][1] if samples else 0.0)
 
         # 无采样: 提示等待
@@ -500,7 +517,7 @@ class InfoCard:
                           fill=pal["faint"], font=fonts.label())
             return
 
-        prices = [v for _t, v in samples]
+        prices = [s[1] for s in samples]
         lo = min(min(prices), prev)
         hi = max(max(prices), prev)
         if hi - lo < 1e-9:
@@ -509,37 +526,44 @@ class InfoCard:
         mid = (hi + lo) / 2
         lo, hi = mid - span / 2, mid + span / 2
 
-        # 布局: 图区底部是红绿柱状带, 上方是撮合价曲线
-        band_h = int((y2 - y1) * 0.34)
+        # 布局: 底部是量柱带, 上方是撮合价曲线
+        band_h = int((y2 - y1) * 0.36)
         band_top = y2 - band_h
 
         # 昨收参考虚线
         py_prev = band_top - (prev - lo) / (hi - lo) * (band_top - y1)
         c.create_line(x1, py_prev, x2, py_prev, fill=pal["border"], dash=(3, 3))
 
-        # 每段涨跌红绿柱(底部柱状带: 红=该段上涨, 绿=该段下跌)
+        # 量柱: 高度 = 该段虚拟撮合量, 颜色 = 买卖余量对比
         n_seg = 24
-        seg_vals = []
+        buckets = []
         for i in range(n_seg):
-            a = int(i * len(prices) / n_seg)
-            b = max(a + 1, int((i + 1) * len(prices) / n_seg))
-            b = min(b, len(prices))
-            seg_vals.append(prices[a:b])
-        deltas = [seg[-1] - seg[0] for seg in seg_vals if len(seg) >= 2]
-        max_d = max([abs(d) for d in deltas] or [1e-9])
-        bar_w = max(3, int((x2 - x1) / n_seg * 0.6))
-        for i, seg in enumerate(seg_vals):
-            if len(seg) < 2:
+            a = int(i * len(samples) / n_seg)
+            b = max(a + 1, int((i + 1) * len(samples) / n_seg))
+            b = min(b, len(samples))
+            buckets.append(samples[a:b])
+        vols = [max((s[2] for s in seg), default=0.0) for seg in buckets]
+        max_v = max(vols) if max(vols) > 0 else 1.0
+        bar_w = max(3, int((x2 - x1) / n_seg * 0.62))
+        for i, seg in enumerate(buckets):
+            if not seg:
                 continue
-            delta = seg[-1] - seg[0]
+            vol = vols[i]
+            buy = max((s[3] for s in seg), default=0.0)
+            sell = max((s[4] for s in seg), default=0.0)
             cx = x1 + (x2 - x1) * (i + 0.5) / n_seg
-            hgt = max(3.0, abs(delta) / max_d * band_h)
+            hgt = max(2.0, vol / max_v * band_h) if vol > 0 else 2.0
             hgt = min(hgt, band_h)
-            col = pal["pos"] if delta >= 0 else pal["neg"]
+            if buy > sell:
+                col = pal["pos"]                 # 买压: 红
+            elif sell > buy:
+                col = pal["neg"]                 # 卖压: 绿
+            else:
+                col = pal["muted"]               # 均衡
             c.create_rectangle(cx - bar_w / 2, y2 - hgt, cx + bar_w / 2, y2,
                                fill=col, outline="")
 
-        # 撮合价曲线(画在柱状带上方)
+        # 撮合价曲线(画在量柱带上方)
         n = len(prices)
         coords = []
         for i, v in enumerate(prices):
@@ -552,13 +576,17 @@ class InfoCard:
                       coords[-2] + 2.6 * S, coords[-1] + 2.6 * S,
                       fill=color, outline=pal["card_bg"])
 
-        # 标注
+        # 标注: 左=标题, 右=撮合价与买卖余量(紧凑; 时间刻度在轴上已有)
+        buy_now = samples[-1][3]
+        sell_now = samples[-1][4]
         c.create_text(x1, y1 - int(13 * S),
-                      text="集合竞价 09:15–09:25", anchor="w",
+                      text="集合竞价", anchor="w",
                       fill=pal["muted"], font=fonts.tiny())
         c.create_text(x2, y1 - int(13 * S),
-                      text=("撮合价 %s" % D.fmt_price(prices[-1], q.dp)),
-                      anchor="e", fill=color, font=fonts.num(-3, True))
+                      text=("撮合价 %s · 买%s 卖%s手"
+                            % (D.fmt_price(prices[-1], q.dp),
+                               "{:,}".format(int(buy_now)), "{:,}".format(int(sell_now)))),
+                      anchor="e", fill=color, font=fonts.tiny())
 
         # 9:25 撮合后: 补真实的竞价成交量柱
         if phase == "matched" and q.volume > 0:
@@ -1039,8 +1067,8 @@ class SettingsWindow(BaseDialog):
         qr = tk.Canvas(row, width=size, height=size, bg=pal["panel_alt"],
                        highlightthickness=0, bd=0, cursor="hand2")
         qr.pack(side="left")
-        qr.create_rectangle(0, 0, size, size, fill="#FFFFFF",
-                            outline=pal["border"], width=1)
+        qr.create_rectangle(0, 0, size, size, fill=pal["card_bg"],
+                            outline=pal["border_soft"], width=1)
         if photo is not None:
             qr.create_image(size / 2, size / 2, image=photo)
             qr.image = photo
@@ -1366,32 +1394,74 @@ class SupportDialog(BaseDialog):
     key = "support"
 
     def __init__(self, app):
-        super().__init__(app, "支持开发者", 430, 600)
-        self.header("感谢支持", "如果这个小工具帮到了你，欢迎扫码")
+        super().__init__(app, "支持开发者", 300, 400, min_size=(240, 300))
+        self.header("感谢支持", "欢迎扫码")
         pal = self.pal
         body = tk.Frame(self.body, bg=pal["panel"])
-        body.pack(fill="both", expand=True, pady=(6, 0))
-        card = tk.Frame(body, bg="#FFFFFF", highlightbackground=pal["border"],
-                        highlightthickness=1)
-        card.pack(pady=(8, 10))
+        body.pack(fill="both", expand=True, pady=(4, 0))
+        self._qr_card = tk.Frame(body, bg=pal["card_bg"],
+                                 highlightbackground=pal["border_soft"],
+                                 highlightthickness=1)
+        self._qr_card.pack(pady=(6, 8))
         photo = _load_support_photo(app, "support.png")
         if photo is not None:
-            label = tk.Label(card, image=photo, bg="#FFFFFF", bd=0)
-            label.image = photo
-            label.pack(padx=12, pady=12)
+            self._qr_base = photo
+            self.qr_label = tk.Label(self._qr_card, image=photo, bg=pal["card_bg"], bd=0)
+            self.qr_label.image = photo
+            self.qr_label.pack(padx=10, pady=10)
         else:
-            tk.Label(card, text="赞赏码图片缺失\n请将 assets 文件夹放在程序旁边",
-                     bg="#FFFFFF", fg="#666666", font=self.fonts.label(),
-                     justify="center").pack(padx=28, pady=60)
+            self._qr_base = None
+            self.qr_label = tk.Label(self._qr_card, text="赞赏码图片缺失",
+                                     bg=pal["card_bg"], fg=pal["muted"],
+                                     font=self.fonts.label(), justify="center")
+            self.qr_label.pack(padx=28, pady=50)
         tk.Label(body, text="微信扫码 · 韩 的赞赏码", bg=pal["panel"], fg=pal["text_dim"],
                  font=self.fonts.label()).pack()
         tk.Label(body, text="你的支持是持续更新的动力 ♥", bg=pal["panel"],
-                 fg=pal["muted"], font=self.fonts.tiny()).pack(pady=(4, 0))
+                 fg=pal["muted"], font=self.fonts.tiny()).pack(pady=(3, 0))
 
         foot = tk.Frame(self.body, bg=pal["panel"])
-        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 12))
+        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
         CanvasButton(foot, "关闭", self.close, pal, self.fonts, kind="primary",
-                     width=90, height=34, scale=self.S).pack(side="right")
+                     width=84, height=32, scale=self.S).pack(side="right")
+
+        # 二维码随窗口缩放(防抖)
+        self._qr_job = None
+        self.win.bind("<Configure>", self._on_qr_resize)
+        self.win.after(120, self._apply_qr_size)
+
+    def _on_qr_resize(self, event):
+        if event.widget is not self.win:
+            return
+        if self._qr_job is not None:
+            try:
+                self.win.after_cancel(self._qr_job)
+            except tk.TclError:
+                pass
+        try:
+            self._qr_job = self.win.after(120, self._apply_qr_size)
+        except tk.TclError:
+            self._qr_job = None
+
+    def _apply_qr_size(self):
+        """按窗口大小调整二维码尺寸: 略小于窗口, 拉大窗口二维码跟着变大。"""
+        self._qr_job = None
+        if self._qr_base is None:
+            return
+        try:
+            w = self.win.winfo_width()
+            h = self.win.winfo_height()
+        except tk.TclError:
+            return
+        size = int(min(w * 0.72, h * 0.62))
+        size = max(180, min(size, 520))
+        import sb_support_img
+        photo = sb_support_img.scaled_to(self._qr_base, size)
+        try:
+            self.qr_label.config(image=photo)
+            self.qr_label.image = photo
+        except tk.TclError:
+            pass
 
 
 # ---------------- 自选股管理 ----------------
