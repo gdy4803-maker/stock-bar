@@ -1233,7 +1233,7 @@ class SettingsWindow(BaseDialog):
         sec = self.section(parent, "快捷键")
         items = [("悬停", "查看分时与持仓详情"), ("左键", "切换下一只自选"),
                  ("→ / ←", "切换自选"), ("右键", "打开菜单"),
-                 ("Ctrl + ,", "打开设置"), ("F5", "重新加载配置"),
+                 ("Ctrl + Shift + S", "打开设置"), ("F5", "重新加载配置"),
                  ("Ctrl + M", "管理自选股"), ("Ctrl + H", "持仓设置"),
                  ("Esc", "关闭窗口/卡片")]
         for k, v in items:

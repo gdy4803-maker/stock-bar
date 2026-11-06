@@ -673,7 +673,7 @@ class StockBar:
         self.input.bind("<Up>", lambda e: self._switch(-1))
         self.input.bind("<Down>", lambda e: self._switch(1))
         self.input.bind("<Escape>", lambda e: self._hide_card())
-        self.input.bind("<Control-comma>", lambda e: self.open_settings())
+        self.input.bind("<Control-Shift-S>", lambda e: self.open_settings())
         self.input.bind("<Control-m>", lambda e: self.open_manage())
         self.input.bind("<Control-h>", lambda e: self.open_holdings())
         self.input.bind("<Control-c>", lambda e: self.copy_quotes())
@@ -1011,7 +1011,9 @@ class StockBar:
         else:
             x, y = self._x, self._y
         if self.cfg.get("dock_taskbar"):
-            x, y = self._dock_pos(w, h)      # 嵌入任务栏(左): 位置由任务栏决定
+            # 嵌入任务栏: 只在"开启嵌入"时找一次空位; 之后尺寸变化只跟随、不搬家
+            # (每次重扫会被弹出窗口当成障碍物, 还会把用户拖好的位置冲掉)
+            x, y = self._dock_pos(w, h, rescan=False)
         x, y = self.screen.clamp(x, y, w, h)
         self._x, self._y = x, y
         self._w, self._h = w, h
@@ -1446,7 +1448,7 @@ class StockBar:
                           "command": self.start_update})
             items.append({"type": "sep"})
         items += [
-            {"type": "cmd", "label": "设置…", "shortcut": "Ctrl+,", "command": self.open_settings},
+            {"type": "cmd", "label": "设置…", "shortcut": "Ctrl+Shift+S", "command": self.open_settings},
             {"type": "sep"},
             {"type": "cmd", "label": "管理自选股…", "shortcut": "Ctrl+M", "command": self.open_manage},
             {"type": "cmd", "label": "持仓设置…", "shortcut": "Ctrl+H", "command": self.open_holdings},
@@ -1604,16 +1606,23 @@ class StockBar:
             pass
 
     # ---------- 任务栏嵌入 ----------
-    def _dock_pos(self, w: int | None = None, h: int | None = None) -> tuple[int, int]:
-        """嵌入任务栏(左)时的目标坐标: 优先落在任务栏空位上, 垂直居中。"""
+    def _dock_pos(self, w: int | None = None, h: int | None = None,
+                  rescan: bool = True) -> tuple[int, int]:
+        """嵌入任务栏(左)时的目标坐标: 垂直居中; rescan=True 才找任务栏空位。
+
+        rescan=False 保持当前 x(用户拖好的位置/尺寸变化时只跟随不搬家)。
+        """
         w = self._w if w is None else w
         h = self._h if h is None else h
         bx, by, bw, bh = self.screen.taskbar_band(self._x + self._w // 2,
                                                  self._y + self._h // 2)
-        # 找任务栏里的空位(避开天气组件/开始按钮等已有元素), 找不到才贴左端
-        gap = self.screen.find_free_span(bx, by, bw, bh, w + int(24 * self.scale),
-                                        ignore=(self._x, self._x + self._w))
-        x = gap if gap is not None else bx + int(12 * self.scale)
+        if rescan:
+            # 找任务栏里的空位(避开天气组件/开始按钮等已有元素), 找不到才贴左端
+            gap = self.screen.find_free_span(bx, by, bw, bh, w + int(24 * self.scale),
+                                            ignore=(self._x, self._x + self._w))
+            x = gap if gap is not None else bx + int(12 * self.scale)
+        else:
+            x = self._x
         y = by + max(0, (bh - h) // 2)
         return self.screen.clamp(x, y, w, h)
 
@@ -1675,11 +1684,12 @@ class StockBar:
     def _keep_on_top(self):
         self._restack_bar()
         if self.cfg.get("dock_taskbar"):
-            # 任务栏位置/高度变化(换显示器、改设置等)时重新嵌入
+            # 任务栏位置/高度变化(换显示器、改设置等)时重新嵌入; 不重扫空位
+            # (重扫会把弹出的设置/持仓窗口当成障碍物, 让胶囊乱跳)
             band = self.screen.taskbar_band(self._x + self._w // 2, self._y + self._h // 2)
             if band != getattr(self, "_dock_band", None):
                 self._dock_band = band
-                self._set_pos(*self._dock_pos())
+                self._set_pos(*self._dock_pos(rescan=False))
 
     # ---------- 启动/退出 ----------
     def _cancel_pollers(self):
