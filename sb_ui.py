@@ -404,8 +404,11 @@ class InfoCard:
         if not p["simple"]:
             self._draw_chart(c, p, q, color, soft)
             phase = auction_phase()
-            if phase:
-                t1, t2 = ("09:15", "09:25")
+            if phase == "auction":
+                # 竞价进行中: 右端是实时时间(而不是固定的 09:25)
+                t1, t2 = "09:15", time.strftime("%H:%M")
+            elif phase:
+                t1, t2 = "09:15", "09:25"
             else:
                 t1, t2 = self._first_time(), self._last_time()
             c.create_text(pad, p["time"] + 4 * S, text=t1, anchor="w",
