@@ -124,6 +124,8 @@ class Quote:
     time: str              # YYYYMMDDHHMMSS
     dp: int = 2            # 价格小数位
     is_index: bool = False
+    bid1: float = 0.0      # 买一价
+    ask1: float = 0.0      # 卖一价
     bid1_vol: float = 0.0  # 买一量(集合竞价时 = 虚拟撮合量)
     ask1_vol: float = 0.0  # 卖一量
     buy_rest: float = 0.0  # 买余量(集合竞价: 撮合后未成交的买单)
@@ -450,6 +452,8 @@ def _fetch_tencent(codes, index_set, timeout: float) -> dict[str, Quote]:
                 time=fields[30],
                 dp=_price_dp(price_raw),
                 is_index=code in index_set,
+                bid1=_to_float(fields[9]) if len(fields) > 9 else 0.0,
+                ask1=_to_float(fields[19]) if len(fields) > 19 else 0.0,
                 bid1_vol=_to_float(fields[10]) if len(fields) > 20 else 0.0,
                 ask1_vol=_to_float(fields[20]) if len(fields) > 20 else 0.0,
                 buy_rest=_to_float(fields[12]) if len(fields) > 22 else 0.0,
@@ -557,6 +561,13 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
         cur = merged.get(code)
         # 时间戳(YYYYMMDDHHMMSS)字典序即时间序; 相同则保留腾讯
         if cur is None or str(q.time) > str(cur.time):
+            if cur is not None:
+                # 新浪源不带五档盘口: 沿用腾讯的买一/卖一(否则盘口会变 0)
+                if q.bid1 <= 0 and cur.bid1 > 0:
+                    q.bid1, q.ask1 = cur.bid1, cur.ask1
+                if q.bid1_vol <= 0 and cur.bid1_vol > 0:
+                    q.bid1_vol, q.ask1_vol = cur.bid1_vol, cur.ask1_vol
+                    q.buy_rest, q.sell_rest = cur.buy_rest, cur.sell_rest
             merged[code] = q
     return merged
 
@@ -702,6 +713,19 @@ def fmt_amount(amount: float) -> str:
     if a >= 1e4:
         return f"{a / 1e4:.2f}亿"
     return f"{a:,.0f}万"
+
+
+def fmt_yi_wan(value: float) -> str:
+    """金额(元)按 亿/万 显示, 最多 2 位小数: 12.35亿 / 72.39万 / 8,600。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if abs(v) >= 1e8:
+        return ("%.2f" % (v / 1e8)).rstrip("0").rstrip(".") + "亿"
+    if abs(v) >= 1e4:
+        return ("%.2f" % (v / 1e4)).rstrip("0").rstrip(".") + "万"
+    return "{:,.0f}".format(v)
 
 
 def fmt_money(value: float) -> str:

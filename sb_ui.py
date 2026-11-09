@@ -411,9 +411,9 @@ class InfoCard:
                 t1, t2 = "09:15", "09:25"
             else:
                 t1, t2 = self._first_time(), self._last_time()
-            c.create_text(pad, p["time"] + 4 * S, text=t1, anchor="w",
+            c.create_text(pad, p["time"] + 8 * S, text=t1, anchor="w",
                           fill=pal["faint"], font=fonts.tiny())
-            c.create_text(w - pad, p["time"] + 4 * S, text=t2, anchor="e",
+            c.create_text(w - pad, p["time"] + 8 * S, text=t2, anchor="e",
                           fill=pal["faint"], font=fonts.tiny())
 
         # 数据网格
@@ -586,9 +586,10 @@ class InfoCard:
                       text="集合竞价", anchor="w",
                       fill=pal["muted"], font=fonts.tiny())
         c.create_text(x2, y1 - int(13 * S),
-                      text=("撮合价 %s · 买%s 卖%s手"
+                      text=("撮合价 %s · 买%s 卖%s"
                             % (D.fmt_price(prices[-1], q.dp),
-                               "{:,}".format(int(buy_now)), "{:,}".format(int(sell_now)))),
+                               D.fmt_yi_wan(prices[-1] * buy_now * 100),
+                               D.fmt_yi_wan(prices[-1] * sell_now * 100))),
                       anchor="e", fill=color, font=fonts.tiny())
 
         # 9:25 撮合后: 补真实的竞价成交量柱
@@ -613,10 +614,21 @@ class InfoCard:
         pad = p["pad"]
         x1, x2 = pad, p["w"] - pad
         y1, y2 = p["chart"], p["chart"] + 64 * S
-        # 图例
+        # 图例: 左=分时, 右=买一/卖一报价(价×手)
         c.create_text(x1, p["legend"], text="分时", anchor="nw", fill=pal["faint"],
                       font=fonts.tiny())
-        if q.prev_close:
+        if q.bid1 > 0 or q.ask1 > 0:
+            _text_run(c, x2, p["legend"] + int(7 * S), [
+                ("买一 ", fonts.tiny(), pal["faint"]),
+                ("%s×%s" % (D.fmt_price(q.bid1, q.dp),
+                            D.fmt_yi_wan(q.bid1 * q.bid1_vol * 100)),
+                 fonts.tiny(), pal["pos"]),
+                ("  卖一 ", fonts.tiny(), pal["faint"]),
+                ("%s×%s" % (D.fmt_price(q.ask1, q.dp),
+                            D.fmt_yi_wan(q.ask1 * q.ask1_vol * 100)),
+                 fonts.tiny(), pal["neg"]),
+            ], anchor="e")
+        elif q.prev_close:
             c.create_text(x2, p["legend"], text="昨收 " + D.fmt_price(q.prev_close, q.dp),
                           anchor="ne", fill=pal["faint"], font=fonts.tiny())
         c.create_line(x1, y2, x2, y2, fill=pal["border_soft"])
@@ -972,10 +984,10 @@ class SettingsWindow(BaseDialog):
         tk.Label(r, text=f"当前 {n} 只自选", bg=pal["panel_alt"], fg=pal["text_dim"],
                  font=self.fonts.label()).pack(side="left")
         CanvasButton(r, "持仓设置…", self.app.open_holdings, pal, self.fonts,
-                     kind="ghost", width=92, height=30, scale=self.S,
+                     kind="ghost", width=92, height=32, scale=self.S,
                      bg=pal["panel_alt"]).pack(side="right", padx=(8, 0))
         CanvasButton(r, "管理自选股…", self.app.open_manage, pal, self.fonts,
-                     kind="primary", width=104, height=30, scale=self.S,
+                     kind="primary", width=104, height=32, scale=self.S,
                      bg=pal["panel_alt"]).pack(side="right")
 
     # ---- 更新 ----
@@ -997,10 +1009,10 @@ class SettingsWindow(BaseDialog):
         self._update_chip.pack(side="left", padx=(10, 0))
         r = self.row(sec, "检查更新")
         CanvasButton(r, "立即检查", self._check_update_now, pal, F,
-                     kind="ghost", width=92, height=30, scale=S,
+                     kind="ghost", width=92, height=32, scale=S,
                      bg=pal["panel_alt"]).pack(side="left")
         self._update_btn = CanvasButton(r, "更新", self._do_update, pal, F,
-                                        kind="primary", width=92, height=30, scale=S,
+                                        kind="primary", width=92, height=32, scale=S,
                                         bg=pal["panel_alt"])
         self._btn_shown = False        # 「更新」按钮: 仅有新版本时出现
         tk.Label(sec, text="自动重启到新版，配置不变", bg=pal["panel_alt"],
@@ -1114,7 +1126,7 @@ class SettingsWindow(BaseDialog):
         self._repo_lab.pack(side="left", fill="x", expand=True)
         self._repo_lab.bind("<Button-1>", lambda e: self._copy_repo())
         CanvasButton(r, "复制仓库", self._copy_repo, pal, self.fonts,
-                     kind="ghost", width=84, height=30, scale=self.S,
+                     kind="ghost", width=84, height=32, scale=self.S,
                      bg=pal["panel_alt"]).pack(side="right")
 
     def _copy_repo(self):
@@ -1159,7 +1171,7 @@ class SettingsWindow(BaseDialog):
         entry.bind("<Return>", lambda e: self._apply_index())
         entry.bind("<FocusOut>", lambda e: self._apply_index())
         CanvasButton(r, "应用", self._apply_index, pal, self.fonts, kind="ghost",
-                     width=52, height=30, scale=self.S,
+                     width=52, height=32, scale=self.S,
                      bg=pal["panel_alt"]).pack(side="left", padx=(8, 0))
         self.index_hint = tk.Label(r, text="", bg=pal["panel_alt"], fg=pal["faint"],
                                    font=self.fonts.tiny())
@@ -1264,11 +1276,11 @@ class SettingsWindow(BaseDialog):
         foot = tk.Frame(self.body, bg=pal["panel"])
         foot.pack(fill="x", side="bottom", padx=18, pady=(4, 12))
         CanvasButton(foot, "恢复默认", self._reset, pal, self.fonts, kind="quiet",
-                     width=82, height=32, scale=self.S).pack(side="left")
+                     width=84, height=32, scale=self.S).pack(side="left")
         tk.Label(foot, text="配置保存在程序同目录 config.json", bg=pal["panel"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(12, 0))
         CanvasButton(foot, "完成", self.close, pal, self.fonts, kind="primary",
-                     width=82, height=32, scale=self.S).pack(side="right")
+                     width=84, height=32, scale=self.S).pack(side="right")
 
     # ---- 回调 ----
     def _apply(self):
@@ -1499,9 +1511,9 @@ class ManageStocksWindow(BaseDialog):
                                font=self.fonts.label(), anchor="w")
         self.status.pack(side="left")
         CanvasButton(foot, "保存并应用", self._save, pal, self.fonts, kind="primary",
-                     width=108, height=34, scale=self.S).pack(side="right")
+                     width=104, height=32, scale=self.S).pack(side="right")
         CanvasButton(foot, "取消", self.close, pal, self.fonts, kind="ghost",
-                     width=76, height=34, scale=self.S).pack(side="right", padx=(0, 8))
+                     width=84, height=32, scale=self.S).pack(side="right", padx=(0, 8))
 
         body = tk.Frame(self.body, bg=pal["panel"])
         body.pack(fill="both", expand=True, padx=18, pady=(10, 6))
@@ -1516,7 +1528,7 @@ class ManageStocksWindow(BaseDialog):
         self.entry.bind("<Return>", lambda e: self._search_now())
         self.entry.bind("<KeyRelease>", self._on_key)
         CanvasButton(search, "搜索", self._search_now, pal, self.fonts, kind="primary",
-                     width=66, height=30, scale=self.S, bg=pal["panel_alt"]).pack(
+                     width=66, height=32, scale=self.S, bg=pal["panel_alt"]).pack(
             side="left", padx=8, pady=7)
         tk.Label(search, text="支持名称 / 代码 / 拼音首字母，如 茅台、510300", bg=pal["panel_alt"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(2, 12))
@@ -1791,7 +1803,7 @@ class HoldingsWindow(BaseDialog):
                                font=self.fonts.label())
         self.status.pack(side="left")
         CanvasButton(foot, "完成", self.close, pal, self.fonts, kind="primary",
-                     width=82, height=34, scale=S).pack(side="right")
+                     width=84, height=32, scale=S).pack(side="right")
 
         body = tk.Frame(self.body, bg=pal["panel"])
         body.pack(fill="both", expand=True, padx=18, pady=(8, 4))
@@ -1859,12 +1871,12 @@ class HoldingsWindow(BaseDialog):
         btns = tk.Frame(trade, bg=pal["panel_alt"])
         btns.pack(fill="x", padx=14, pady=(6, 12))
         CanvasButton(btns, "买入", lambda: self._trade("buy"), pal, self.fonts,
-                     kind="primary", width=92, height=34, scale=S,
+                     kind="primary", width=92, height=32, scale=S,
                      bg=pal["panel_alt"]).pack(side="left")
         CanvasButton(btns, "卖出", lambda: self._trade("sell"), pal, self.fonts,
-                     width=92, height=34, scale=S, bg=pal["panel_alt"]).pack(side="left", padx=(12, 0))
+                     width=92, height=32, scale=S, bg=pal["panel_alt"]).pack(side="left", padx=(12, 0))
         CanvasButton(btns, "全部卖出", self._sell_all, pal, self.fonts, kind="quiet",
-                     width=104, height=34, scale=S, bg=pal["panel_alt"]).pack(side="left", padx=(12, 0))
+                     width=104, height=32, scale=S, bg=pal["panel_alt"]).pack(side="left", padx=(12, 0))
         tk.Label(btns, text="回车 = 买入", bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="right", padx=(0, 2))
 
@@ -1888,10 +1900,13 @@ class HoldingsWindow(BaseDialog):
             self.log_tree.column(cid, width=int(width * S), anchor=anchor, stretch=True)
         for tag, col in (("up", pal["pos"]), ("down", pal["neg"]), ("flat", pal["text"])):
             self.log_tree.tag_configure(tag, foreground=col)
+        # 先占住底部按钮行, 再让列表填充剩余高度(否则列表会把按钮挤出框外)
+        btnrow = tk.Frame(log, bg=pal["panel_alt"])
+        btnrow.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        CanvasButton(btnrow, "删除所选记录", self._del_trade, pal, self.fonts, kind="quiet",
+                     width=104, height=32, scale=S,
+                     bg=pal["panel_alt"]).pack(anchor="w")
         self.log_tree.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-        CanvasButton(log, "删除所选记录", self._del_trade, pal, self.fonts, kind="quiet",
-                     width=118, height=28, scale=S,
-                     bg=pal["panel_alt"]).pack(anchor="w", padx=10, pady=(0, 8))
         # 分割把手: 下拉变高成交记录, 下方汇总下移(有最小值)
         SizeHandle(body, lambda dx, dy: self._drag_list("log", dy), pal, S, "ns",
                    thick=int(7 * S), on_release=self._save_layout).pack(fill="x", pady=(3, 3))
