@@ -18,6 +18,8 @@ socket.setdefaulttimeout(10.0)
 
 QUOTE_URL = "https://qt.gtimg.cn/q={codes}"
 SINA_URL = "https://hq.sinajs.cn/list={codes}"
+EAST_URL = ("https://push2.eastmoney.com/api/qt/ulist.np/get"
+            "?fltt=2&invt=2&fields={fields}&secids={secids}")
 MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}&_var=min_data"
 SEARCH_URL = "https://smartbox.gtimg.cn/s3/?q={kw}&t=all"
 RELEASES_API = "https://api.github.com/repos/gdy4803-maker/stock-bar/releases?per_page=20"
@@ -370,6 +372,48 @@ def day_pnl_of(trades, price: float, prev_close: float, today: str = "",
     return pnl
 
 
+def day_base_of(trades, prev_close: float, today: str = "") -> float:
+    """今日盈亏的"基数"(元) —— 与 day_pnl_of 同一套分批口径:
+
+    老仓份额按昨收、今日买入份额按买价; 卖出消耗掉的份额也按其参考价计入基数。
+    今日涨幅 = day_pnl_of(...) / day_base_of(...) × 100 —— 这样"今日买入有亏损"时
+    金额与涨幅两种显示才对得上(此前涨幅全按昨收算, 与金额口径不一致)。
+    """
+    today = today or _dt.date.today().isoformat()
+    items = [t for t in (trades or []) if isinstance(t, dict)]
+    prior = [t for t in items if str(t.get("time", ""))[:10] < today]
+    prior_pos, _ = position_of(prior)
+    tranches: list[list[float]] = []
+    if prior_pos.lots > 0 and prev_close > 0:
+        tranches.append([float(prior_pos.lots * 100), float(prev_close)])
+    day = [t for t in items if str(t.get("time", ""))[:10] == today]
+    day.sort(key=lambda t: str(t.get("time", "")))
+    base = 0.0
+    for t in day:
+        try:
+            tp = float(t.get("price") or 0)
+            shares = float(int(t.get("lots") or 0) * 100)
+        except (TypeError, ValueError):
+            continue
+        if shares <= 0 or tp <= 0:
+            continue
+        if t.get("side") == "buy":
+            tranches.append([shares, tp])
+        elif t.get("side") == "sell":
+            remain = shares
+            while remain > 0 and tranches:
+                tr = tranches[0]
+                take = min(remain, tr[0])
+                base += tr[1] * take           # 卖出消耗份额的参考价基数
+                tr[0] -= take
+                remain -= take
+                if tr[0] <= 1e-9:
+                    tranches.pop(0)
+    for shares, ref in tranches:
+        base += ref * shares                   # 仍持有份额的参考价基数
+    return base
+
+
 def sold_today(trades, today: str = "") -> bool:
     """今天是否有卖出成交(用于识别"今日清仓", 今天清仓的仍计入今日盈亏)。"""
     today = today or _dt.date.today().isoformat()
@@ -521,11 +565,74 @@ def _fetch_sina(codes, index_set, timeout: float) -> dict[str, Quote]:
     return result
 
 
+def _fetch_eastmoney(codes, index_set, timeout: float) -> dict[str, Quote]:
+    """东方财富源(第三源)——腾讯/新浪全挂时兜底接管。
+
+    字段(实测校准): f2=现价 f3=涨跌% f4=涨跌额 f5=量(手) f6=额(元)
+    f12=代码 f13=市场 f14=名称 f15=高 f16=低 f17=开 f18=昨收
+    """
+    if not codes:
+        return {}
+    secids = ",".join(("1." + c[2:] if c.startswith("sh") else "0." + c[2:]) for c in codes)
+    fields = "f2,f3,f4,f5,f6,f12,f13,f14,f15,f16,f17,f18"
+    url = EAST_URL.format(fields=fields, secids=secids)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": HEADERS["User-Agent"], "Referer": "https://quote.eastmoney.com/"})
+    raw = None
+    last_exc: Exception | None = None
+    for attempt in range(3):                 # 东财偶发拒连/限流: 退避重试
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            break
+        except Exception as exc:
+            last_exc = exc
+            import time as _t
+            _t.sleep(0.6 * (attempt + 1))
+    if raw is None:
+        raise last_exc if last_exc else RuntimeError("东财无响应")
+    payload = json.loads(raw.decode("utf-8", "replace"))
+    rows = ((payload.get("data") or {}).get("diff")) or []
+    by_num = {c[2:]: c for c in codes}
+    now = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    out: dict[str, Quote] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        num = str(r.get("f12") or "")
+        code = by_num.get(num)
+        if not code:
+            continue
+        price_raw = str(r.get("f2") or "")
+        price = _to_float(price_raw)
+        prev = _to_float(r.get("f18"))
+        if price <= 0 or prev <= 0:
+            continue
+        out[code] = Quote(
+            code=code,
+            name=str(r.get("f14") or code),
+            price=price,
+            prev_close=prev,
+            open=_to_float(r.get("f17")),
+            high=_to_float(r.get("f15")),
+            low=_to_float(r.get("f16")),
+            change=_to_float(r.get("f4")),
+            pct=_to_float(r.get("f3")),
+            volume=_to_float(r.get("f5")),          # 手
+            amount=_to_float(r.get("f6")) / 10000.0,  # 元 -> 万元
+            time=now,
+            dp=_price_dp(price_raw),
+            is_index=code in index_set,
+        )
+    return out
+
+
 def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote]:
     """批量拉取实时行情, 返回 {code: Quote}。网络/解析异常会向上抛出。
 
     腾讯 + 新浪双源并发, 按行情时间戳取更新的那条 ——
     交易所 L1 快照约 3s 一拍, 两源刷新相位不同, 合并后比任一单源更快看到新价。
+    两源都失败时用东方财富兜底(第三源)。
     """
     codes = [c for c in codes if c]
     if not codes:
@@ -554,7 +661,15 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
         # 不等挂住的线程: 立刻返回, 让上层继续用已有数据
         pool.shutdown(wait=False, cancel_futures=True)
     if not tencent and not sina:
-        raise errors[0] if errors else RuntimeError("行情源无数据")
+        # 第三源兜底: 东财(主源全挂时接管, 保证行情不断)
+        try:
+            east = _fetch_eastmoney(codes, index_set, timeout)
+        except Exception as exc:
+            errors.append(exc if isinstance(exc, Exception) else RuntimeError("东财"))
+            raise errors[0] if errors else RuntimeError("行情源无数据")
+        if not east:
+            raise errors[0] if errors else RuntimeError("行情源无数据")
+        return east
 
     merged = dict(tencent)
     for code, q in sina.items():
@@ -726,6 +841,119 @@ def fmt_yi_wan(value: float) -> str:
     if abs(v) >= 1e4:
         return ("%.2f" % (v / 1e4)).rstrip("0").rstrip(".") + "万"
     return "{:,.0f}".format(v)
+
+
+# ---------------- 集合竞价评分 ----------------
+def auction_score(samples, prev_close: float):
+    """集合竞价评分(-10 ~ +10): 返回 {"total","items","verdict","tone"}。
+
+    samples: [(时间戳, 虚拟撮合价, 虚拟撮合量, 买余量, 卖余量), ...]
+    每项 -2 ~ +2 并附依据文字 —— 评分透明可核对, 不是黑箱结论。
+    """
+    if not samples or prev_close <= 0:
+        return None
+    prices = [float(s[1]) for s in samples if s[1] > 0]
+    vols = [float(s[2]) for s in samples]
+    if len(prices) < 2:
+        return None
+    buy = float(samples[-1][3])
+    sell = float(samples[-1][4])
+    last = prices[-1]
+    gap = (last - prev_close) / prev_close * 100.0
+    items = []
+
+    # 1) 高开幅度: 温和高开最有利, 过度反应不加分
+    if gap > 4.0:
+        s1, d1 = 1, f"高开 {gap:.2f}% 偏大, 过度反应不加分"
+    elif gap >= 1.0:
+        s1, d1 = 2, f"高开 {gap:.2f}%, 温和高开偏强"
+    elif gap >= 0.3:
+        s1, d1 = 1, f"高开 {gap:.2f}%, 略偏强"
+    elif gap > -0.3:
+        s1, d1 = 0, f"平开 {gap:.2f}%, 多空均衡"
+    elif gap > -1.0:
+        s1, d1 = -1, f"低开 {abs(gap):.2f}%, 略偏弱"
+    elif gap > -4.0:
+        s1, d1 = -2, f"低开 {abs(gap):.2f}%, 抛压偏大"
+    else:
+        s1, d1 = -1, f"低开 {abs(gap):.2f}% 偏大, 过度反应或有修复"
+    items.append(("高开幅度", s1, d1))
+
+    # 2) 撮合价趋势(后 1/3 时段的边际变化)
+    k = max(2, len(prices) // 3)
+    slope = (last - prices[-k]) / prev_close * 100.0
+    if slope > 0.3:
+        s2, d2 = 2, f"撮合价稳步上移 {slope:+.2f}%, 买盘持续"
+    elif slope > 0.05:
+        s2, d2 = 1, f"撮合价小幅上移 {slope:+.2f}%"
+    elif slope >= -0.05:
+        s2, d2 = 0, f"撮合价横盘 {slope:+.2f}%"
+    elif slope >= -0.3:
+        s2, d2 = -1, f"撮合价小幅走低 {slope:+.2f}%"
+    else:
+        s2, d2 = -2, f"撮合价持续走低 {slope:+.2f}%, 卖盘持续"
+    items.append(("撮合趋势", s2, d2))
+
+    # 3) 买卖余量(撮合后未成交的买/卖单 = 直接的供需失衡)
+    total_rest = buy + sell
+    if total_rest <= 0:
+        s3, d3 = 0, "无余量(撮合价上买卖充分匹配)"
+    else:
+        ratio = buy / total_rest
+        if ratio >= 0.75:
+            s3, d3 = 2, f"买压 {ratio * 100:.0f}%, 买方主导"
+        elif ratio >= 0.6:
+            s3, d3 = 1, f"买压 {ratio * 100:.0f}%, 略偏买方"
+        elif ratio > 0.4:
+            s3, d3 = 0, f"买压 {ratio * 100:.0f}%, 多空均衡"
+        elif ratio > 0.25:
+            s3, d3 = -1, f"卖压 {(1 - ratio) * 100:.0f}%, 略偏卖方"
+        else:
+            s3, d3 = -2, f"卖压 {(1 - ratio) * 100:.0f}%, 卖方主导"
+    items.append(("买卖力量", s3, d3))
+
+    # 4) 量价配合(末段量能 vs 首段)
+    m = max(2, len(vols) // 3)
+    v_head = sum(vols[:m]) / m
+    v_tail = sum(vols[-m:]) / m
+    price_up = last >= prices[0]
+    vol_up = v_tail > v_head * 1.3 if v_head > 0 else v_tail > 0
+    if vol_up and price_up:
+        s4, d4 = 2, "价升量增, 抢筹配合"
+    elif vol_up and not price_up:
+        s4, d4 = -2, "价跌量增, 抛压释放"
+    elif not vol_up and price_up:
+        s4, d4 = 0, "价升量缩, 上涨缺量"
+    else:
+        s4, d4 = -1, "价跌量缩, 观望为主"
+    items.append(("量价配合", s4, d4))
+
+    # 5) 价格稳定(后半段波动 + 9:20 前后是否"画图")
+    half = prices[len(prices) // 2:]
+    hi2, lo2 = max(half), min(half)
+    wave = (hi2 - lo2) / prev_close * 100.0
+    early_peak = max(prices[:max(2, len(prices) // 2)])
+    drop = (early_peak - last) / prev_close * 100.0
+    if wave <= 0.3 and drop < 0.5:
+        s5, d5 = 1, f"价格稳定(波动 {wave:.2f}%), 意图真实"
+    elif drop >= 1.0:
+        s5, d5 = -1, f"前期冲高回落 {drop:.2f}%, 疑似虚挂撤单"
+    elif wave > 1.5:
+        s5, d5 = -1, f"波动较大(振幅 {wave:.2f}%), 分歧明显"
+    else:
+        s5, d5 = 0, f"波动 {wave:.2f}%, 常规"
+    items.append(("价格稳定", s5, d5))
+
+    total = sum(x[1] for x in items)
+    total = max(-10, min(10, total))
+    if total >= 4:
+        verdict, tone = "偏多：可买入/持有", "pos"
+    elif total <= -4:
+        verdict, tone = "偏空：回避/卖出", "neg"
+    else:
+        verdict, tone = "中性：观望为宜", "flat"
+    return {"total": total, "items": items, "verdict": verdict, "tone": tone,
+            "gap": gap, "buy_ratio": (buy / (buy + sell)) if (buy + sell) > 0 else 0.5}
 
 
 def fmt_money(value: float) -> str:

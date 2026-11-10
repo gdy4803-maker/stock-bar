@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.3.11"
+APP_VERSION = "1.5.0"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -596,6 +596,7 @@ class StockBar:
         self._hovering = False
         self._hover_zone = "pick"
         self._hover_after = None
+        self._auction_saved = ""         # 竞价数据当天是否已存盘
         self._error = False
         self._last_vals: dict[str, float | None] = {}
         self._flash: dict[str, float] = {}
@@ -673,6 +674,9 @@ class StockBar:
         self.input.bind("<Up>", lambda e: self._switch(-1))
         self.input.bind("<Down>", lambda e: self._switch(1))
         self.input.bind("<Escape>", lambda e: self._hide_card())
+        self.input.bind("<Key-1>", lambda e: self._card_view("stock"))
+        self.input.bind("<Key-2>", lambda e: self._card_view("holdings"))
+        self.input.bind("<Key-3>", lambda e: self._card_view("auction"))
         self.input.bind("<Control-Shift-S>", lambda e: self.open_settings())
         self.input.bind("<Control-m>", lambda e: self.open_manage())
         self.input.bind("<Control-h>", lambda e: self.open_holdings())
@@ -1105,6 +1109,22 @@ class StockBar:
         self._render_bar(force=True)
         self.root.after(320, lambda: self._render_bar(force=True))
 
+    def _card_view(self, kind: str):
+        """快捷键 1/2/3: 切换详情卡视图(个股 / 持仓总览 / 竞价评分)。
+        仅在鼠标悬浮行情条上时生效; 鼠标移开卡片照常消失。"""
+        if not self._hovering:
+            return
+        code = self._current_pick_code()
+        if not code:
+            return
+        self._card.code = code
+        if kind == "auction":
+            self._card.show_auction(code)
+        elif kind == "holdings":
+            self._card.show_holdings()
+        else:
+            self._card.show(code)
+
     def _toggle_pnl_display(self):
         """点击持仓段: 切换 涨幅 / 金额 显示。"""
         cur = self.cfg.get("pnl_display", "money")
@@ -1288,6 +1308,7 @@ class StockBar:
     def _on_data(self, quotes: dict):
         self.quotes.update(quotes)
         self._collect_auction(quotes)
+        self._save_auction_data()        # 9:25 后静默存盘(每天一次)
         if self._error:
             self._error = False
         now = time.time()
@@ -1332,6 +1353,11 @@ class StockBar:
                 self._card.refresh()
 
     def _total_pnl_pct(self):
+        """持仓段"涨幅"显示: 与金额口径一致 —— 涨幅 = 今日盈亏 / 基数。
+
+        基数用 day_base_of(老仓按昨收、今日买入按买价), 否则"今日买入有亏损"时
+        金额对、涨幅却对不上(此前涨幅全按昨收算)。
+        """
         total_pnl = 0.0
         total_base = 0.0
         holdings = self.cfg.get("holdings", {})
@@ -1347,9 +1373,9 @@ class StockBar:
             pos, _ = D.position_of(h.get("trades"))
             if pos.lots <= 0 and not D.sold_today(h.get("trades")):
                 continue
-            shares = pos.lots * 100
-            total_pnl += (q.price - q.prev_close) * shares
-            total_base += q.prev_close * shares
+            total_pnl += D.day_pnl_of(h.get("trades"), q.price, q.prev_close,
+                                      quote_time=q.time)
+            total_base += D.day_base_of(h.get("trades"), q.prev_close)
         if not total_base:
             return 0.0                   # 今日未开始/无持仓: 0, 与今日盈亏口径一致
         return total_pnl / total_base * 100.0
@@ -1398,6 +1424,47 @@ class StockBar:
                 arr.append(rec)
             if len(arr) > 800:                # 上限保护(10 分钟足够)
                 del arr[:len(arr) - 800]
+
+    def _save_auction_data(self, force: bool = False):
+        """9:25 后把当天竞价采样存盘(静默攒数据, 供日后训练评分权重)。
+
+        落盘: auction_data/YYYY-MM-DD.json —— 每天几 KB ~ 几十 KB, 不影响性能;
+        同一天多次启动会合并而不是覆盖; 任何异常都静默吞掉(攒数据不打扰用户)。
+        force=True: 退出时兜底, 不受 9:25 时间限制。
+        """
+        if not self._auction or getattr(self, "_auction_saved", "") == time.strftime("%Y-%m-%d"):
+            return
+        if not force and time.localtime().tm_hour * 60 + time.localtime().tm_min < 9 * 60 + 25:
+            return
+        today = time.strftime("%Y-%m-%d")
+        try:
+            folder = os.path.join(BASE_DIR, "auction_data")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, today + ".json")
+            out = {"date": today, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "stocks": {}}
+            if os.path.exists(path):
+                try:
+                    old = json.load(open(path, "r", encoding="utf-8"))
+                    out["stocks"] = old.get("stocks") or {}
+                except Exception:
+                    pass
+            for code, samples in self._auction.items():
+                if not samples:
+                    continue
+                q = self.quotes.get(code)
+                out["stocks"][code] = {
+                    "name": q.name if q else "",
+                    "prev_close": q.prev_close if q else 0.0,
+                    "open": q.open if q else 0.0,          # 9:30 后有值, 用于训练标签
+                    "samples": [list(s) for s in samples],
+                }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+            self._auction_saved = today
+            self._log("竞价数据已存档: %s" % path)
+        except Exception:
+            pass                              # 静默: 攒数据绝不打扰用户
 
     def _pnl_display_value(self):
         """持仓段显示值: 按设置返回涨幅(%)或当日盈亏(元)。"""
@@ -1822,6 +1889,7 @@ class StockBar:
 
     def quit(self):
         self._log("用户退出")
+        self._save_auction_data(force=True)   # 退出兜底: 未到 9:25 也先把采样存下
         self._stop.set()
         self._cancel_pollers()
         try:

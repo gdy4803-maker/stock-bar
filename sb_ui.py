@@ -149,6 +149,19 @@ class InfoCard:
         force_topmost(self.win)
         self.win.lift()
 
+    def show_auction(self, code: str | None = None):
+        """显示竞价评分卡(快捷键 3; 竞价时段实时, 其它时间=当日最近一次)。"""
+        self.kind = "auction"
+        if code:
+            self.code = code
+        self.visible = True
+        self._render()
+        self._place()
+        self.apply_alpha()
+        self.win.deiconify()
+        force_topmost(self.win)
+        self.win.lift()
+
     def hide(self):
         if not self.visible:
             return
@@ -184,6 +197,75 @@ class InfoCard:
             return None
         pos, _ = D.position_of(h.get("trades"))
         return pos if pos.lots > 0 else None
+
+    def _render_auction(self):
+        """竞价评分卡(快捷键 3): 五项得分 + 依据 + 结论, 评分透明可核对。"""
+        pal = self.app.pal
+        fonts = self.app.card_fonts
+        S = self.app.scale * 0.875
+        code = self.code or getattr(self.app, "_current_pick_code", lambda: "")()
+        q = self.app.quotes.get(code)
+        S_ = self.app.scale * 0.875
+        w = int(self.WIDTH * S_ * 1.12)
+        pad = int(16 * S_)
+        today = time.strftime("%Y%m%d")
+        samples = [s for s in (getattr(self.app, "_auction", {}) or {}).get(code, [])
+                   if str(s[0])[:8] == today]
+        sc = D.auction_score(samples, q.prev_close if q else 0.0)
+        rows = sc["items"] if sc else []
+        row_h = int(26 * S_)
+        h = int(96 * S_) + row_h * max(5, len(rows)) + int(64 * S_)
+        self.w, self.h = w, h
+        c = self.canvas
+        c.configure(width=w, height=h)
+        c.delete("all")
+        draw_round_rect(c, 0.5, 0.5, w - 0.5, h - 0.5, 14 * S_, pal["card_bg"],
+                        pal["card_border"], 1)
+
+        # 头部
+        y = pad
+        name = q.name if q else (code or "未选中")
+        _text_run(c, pad, y, [
+            (name, fonts.label(), pal["text"]),
+            ("  " + (D.code_digits(code) if code else ""), fonts.tiny(), pal["faint"]),
+            ("   竞价评分", fonts.tiny(), pal["muted"]),
+        ])
+        y += int(30 * S_)
+
+        if not sc:
+            c.create_text(w / 2, y + int(40 * S_), text="暂无竞价数据\n(需在 9:15–9:25 采集)",
+                          fill=pal["faint"], font=fonts.label(), justify="center")
+            return
+
+        tone = {"pos": pal["pos"], "neg": pal["neg"]}.get(sc["tone"], pal["text_dim"])
+        # 总分
+        c.create_text(pad, y, text=("%+d" % sc["total"]), anchor="w",
+                      fill=tone, font=fonts.num(16, True))
+        c.create_text(pad + int(52 * S_), y + int(3 * S_), text="/ 10",
+                      anchor="w", fill=pal["faint"], font=fonts.tiny())
+        c.create_text(w - pad, y, text=sc["verdict"], anchor="e",
+                      fill=tone, font=fonts.label())
+        y += int(38 * S_)
+
+        # 五项明细
+        c.create_line(pad, y, w - pad, y, fill=pal["border_soft"])
+        y += int(10 * S_)
+        for name2, score, desc in rows:
+            col = pal["pos"] if score > 0 else (pal["neg"] if score < 0 else pal["faint"])
+            c.create_text(pad, y, text=name2, anchor="w", fill=pal["text_dim"],
+                          font=fonts.tiny())
+            c.create_text(pad + int(78 * S_), y, text=("%+d" % score), anchor="w",
+                          fill=col, font=fonts.num(-1, True))
+            c.create_text(pad + int(104 * S_), y, text=desc, anchor="w",
+                          fill=pal["faint"], font=fonts.tiny())
+            y += row_h
+
+        y += int(4 * S_)
+        c.create_line(pad, y, w - pad, y, fill=pal["border_soft"])
+        y += int(14 * S_)
+        # 页脚小字(与个股卡"腾讯行情 · 仅供参考"同位置同风格)
+        c.create_text(w - pad, y, text="评分仅供参考，不构成投资建议", anchor="e",
+                      fill=pal["faint"], font=fonts.tiny())
 
     def _render_holdings(self):
         """持仓总览卡: 真实持仓每只两行 + 底部汇总(悬停行情条持仓段时显示)。"""
@@ -349,6 +431,9 @@ class InfoCard:
     def _render(self):
         if self.kind == "holdings":
             self._render_holdings()
+            return
+        if self.kind == "auction":
+            self._render_auction()
             return
         q = self.app.quotes.get(self.code)
         if not q:
@@ -579,12 +664,20 @@ class InfoCard:
                       coords[-2] + 2.6 * S, coords[-1] + 2.6 * S,
                       fill=color, outline=pal["card_bg"])
 
-        # 标注: 左=标题, 右=撮合价与买卖余量(紧凑; 时间刻度在轴上已有)
+        # 标注: 左=标题+评分徽章, 右=撮合价与买卖余量(紧凑; 时间刻度在轴上已有)
         buy_now = samples[-1][3]
         sell_now = samples[-1][4]
-        c.create_text(x1, y1 - int(13 * S),
-                      text="集合竞价", anchor="w",
-                      fill=pal["muted"], font=fonts.tiny())
+        sc = D.auction_score(samples, prev)
+        parts = [("集合竞价", fonts.tiny(), pal["muted"])]
+        if sc:
+            tone = (pal["pos"] if sc["tone"] == "pos"
+                    else pal["neg"] if sc["tone"] == "neg" else pal["faint"])
+            label = ("偏多" if sc["tone"] == "pos"
+                     else "偏空" if sc["tone"] == "neg" else "中性")
+            parts += [("  [%+d " % sc["total"], fonts.tiny(), tone),
+                      (label, fonts.tiny(), tone),
+                      ("]", fonts.tiny(), tone)]
+        _text_run(c, x1, y1 - int(13 * S), parts)
         c.create_text(x2, y1 - int(13 * S),
                       text=("撮合价 %s · 买%s 卖%s"
                             % (D.fmt_price(prices[-1], q.dp),
@@ -1248,6 +1341,7 @@ class SettingsWindow(BaseDialog):
         sec = self.section(parent, "快捷键")
         items = [("悬停", "查看分时与持仓详情"), ("左键", "切换下一只自选"),
                  ("→ / ←", "切换自选"), ("右键", "打开菜单"),
+                 ("1 / 2 / 3", "换卡片：个股 / 持仓总览 / 竞价评分"),
                  ("Ctrl + Shift + S", "打开设置"), ("F5", "重新加载配置"),
                  ("Ctrl + M", "管理自选股"), ("Ctrl + H", "持仓设置"),
                  ("Esc", "关闭窗口/卡片")]
@@ -1255,6 +1349,11 @@ class SettingsWindow(BaseDialog):
             r = self.row(sec, k)
             tk.Label(r, text=v, anchor="w", bg=pal["panel_alt"],
                      fg=pal["text_dim"], font=self.fonts.label()).pack(side="left")
+        tk.Label(sec, text=("说明：按 1 / 2 / 3 换卡片时，鼠标指针要放在下面的悬浮行情条上才有效；"
+                            "鼠标一移开，卡片就自动关闭。"),
+                 anchor="w", justify="left", bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny(), wraplength=int(560 * self.S)).pack(
+            fill="x", padx=14, pady=(2, 12))
 
     def _build_tips(self, parent):
         pal = self.pal
