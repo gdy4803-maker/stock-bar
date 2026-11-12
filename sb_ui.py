@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import queue
 import sys
@@ -94,9 +95,12 @@ class InfoCard:
         except tk.TclError:
             pass
         self.canvas = tk.Canvas(self.win, bg=KEY_COLOR, highlightthickness=0, bd=0)
+        self.canvas.bind("<Button-1>", self._on_card_click)   # AI 研判按钮
         self.canvas.pack()
         self.code = None
         self.kind = "stock"          # stock=个股/指数详情卡 | holdings=持仓总览卡
+        self._ai_cache = {}          # {code: AI研判文字} —— 按股票分开, 防串号
+        self._ai_busy = set()        # 正在研判的 code 集合
         self.series = None
         self.state = "idle"
         self.visible = False
@@ -214,7 +218,11 @@ class InfoCard:
         sc = D.auction_score(samples, q.prev_close if q else 0.0)
         rows = sc["items"] if sc else []
         row_h = int(26 * S_)
-        h = int(96 * S_) + row_h * max(5, len(rows)) + int(64 * S_)
+        ai_on = bool(self.app.cfg.get("llm_enabled"))
+        ai_h = int(70 * S_) if ai_on else 0
+        if ai_on and self._ai_cache.get(code or ""):
+            ai_h += int(58 * S_)
+        h = int(96 * S_) + row_h * max(5, len(rows)) + int(64 * S_) + ai_h
         self.w, self.h = w, h
         c = self.canvas
         c.configure(width=w, height=h)
@@ -266,6 +274,154 @@ class InfoCard:
         # 页脚小字(与个股卡"腾讯行情 · 仅供参考"同位置同风格)
         c.create_text(w - pad, y, text="评分仅供参考，不构成投资建议", anchor="e",
                       fill=pal["faint"], font=fonts.tiny())
+        # AI 研判(启用后显示按钮; 结果按股票分开展示)
+        self._ai_btn = None
+        ai_text = self._ai_cache.get(code or "")
+        ai_busy = (code or "") in self._ai_busy
+        if sc and self.app.cfg.get("llm_enabled"):
+            bh = int(26 * S_)
+            bx2 = pad + int(96 * S_)
+            by1 = y - int(18 * S_)
+            by2 = by1 + bh
+            draw_round_rect(c, pad, by1, bx2, by2, 6 * S_, pal["accent"], "", 1)
+            c.create_text((pad + bx2) / 2, (by1 + by2) / 2, text="AI 研判",
+                          fill="#FFFFFF", font=fonts.tiny())
+            self._ai_btn = (pad, by1, bx2, by2)
+            if ai_text:
+                c.create_text(pad, y + int(22 * S_), text=ai_text, anchor="nw",
+                              fill=pal["text_dim"], font=fonts.tiny(),
+                              width=int(w - 2 * pad))
+            elif ai_busy:
+                c.create_text(pad, y + int(22 * S_), text="AI 研判生成中…", anchor="nw",
+                              fill=pal["faint"], font=fonts.tiny())
+
+    def _on_card_click(self, event):
+        rect = getattr(self, "_ai_btn", None)
+        if rect and rect[0] <= event.x <= rect[2] and rect[1] <= event.y <= rect[3]:
+            self._ask_ai()
+            return "break"
+
+    def _ask_ai(self):
+        """点击「AI 研判」: 后台线程调用大模型, 结果回到卡片展示(按股票分存)。"""
+        code = self.code or getattr(self.app, "_current_pick_code", lambda: "")()
+        if not code or code in self._ai_busy:
+            return
+        q = self.app.quotes.get(code)
+        today = time.strftime("%Y%m%d")
+        samples = [s for s in (getattr(self.app, "_auction", {}) or {}).get(code, [])
+                   if str(s[0])[:8] == today]
+        sc = D.auction_score(samples, q.prev_close if q else 0.0)
+        if not sc or not q:
+            self._ai_cache[code] = "暂无竞价数据, 无法研判"
+            self._render()
+            return
+        buy = samples[-1][3] if samples else 0
+        sell = samples[-1][4] if samples else 0
+        vol = samples[-1][2] if samples else 0
+        p_start, p_end = samples[0][1], samples[-1][1]
+        prices = [s[1] for s in samples]
+        p_hi, p_lo = max(prices), min(prices)
+        amp = (p_hi - p_lo) / q.prev_close * 100 if q.prev_close else 0.0
+        # 量能时序: 首段 vs 末段平均撮合量(放量/缩量)
+        k = max(2, len(samples) // 3)
+        v_head = sum(s[2] for s in samples[:k]) / k
+        v_tail = sum(s[2] for s in samples[-k:]) / k
+        # 9:20 前后对比(撤单痕迹: 前段冲高、后段回落 = 疑似虚挂)
+        half = max(2, len(samples) // 2)
+        p_early_peak = max(prices[:half])
+        p_after_min = min(prices[half:])
+        fake = (p_early_peak - p_end) / q.prev_close * 100 if q.prev_close else 0.0
+
+        # ---- 补充上下文: 大盘 / 历史竞价 / 开盘后表现 ----
+        extra = []
+        idx = getattr(self.app, "index_code", "")
+        isamp = [s for s in (getattr(self.app, "_auction", {}) or {}).get(idx, [])
+                 if str(s[0])[:8] == today]
+        iq = self.app.quotes.get(idx)
+        if isamp and iq and iq.prev_close > 0:
+            igap = (isamp[-1][1] - iq.prev_close) / iq.prev_close * 100
+            ib, iis = isamp[-1][3], isamp[-1][4]
+            extra.append(f"- 大盘({iq.name})竞价缺口 {igap:+.2f}%, 买卖余量 {ib:.0f}/{iis:.0f}手")
+        hist = self._recent_auction(code)
+        if hist:
+            extra.append("- 该股近%d次竞价: %s" % (len(hist), "; ".join(hist)))
+        # 开盘后表现(9:30 后复盘时很有用)
+        if q.open > 0:
+            extra.append(f"- 开盘后实况: 今开 {q.open:.2f}, 最新 {q.price:.2f}"
+                         f"({q.pct:+.2f}%), 成交 {D.fmt_volume(q.volume)}手,"
+                         f"成交额 {D.fmt_yi_wan(q.amount * 10000)}")
+        # 历史统计 + 基本面(来自公开 MCP 数据服务)
+        brief = D.mcp_stock_brief(code)
+        if brief:
+            extra.append("- 该股基本面与历史统计(数据源 mcp-cn-a-stock):\n" + brief)
+        prompt = (
+            "你是A股盘前研判助手。以下是【真实行情数据】, 请只依据这些数据研判:\n"
+            f"1) 股票: {q.name}({code})\n"
+            f"2) 昨收价: {q.prev_close:.2f}\n"
+            f"3) 竞价起始价: {p_start:.2f}  竞价结束价(撮合价): {p_end:.2f}"
+            f"  期间变动 {(p_end - p_start) / q.prev_close * 100:+.2f}%\n"
+            f"4) 开盘缺口(撮合价vs昨收): {sc['gap']:+.2f}%\n"
+            f"5) 竞价区间: 最高 {p_hi:.2f} / 最低 {p_lo:.2f}, 振幅 {amp:.2f}%\n"
+            f"6) 竞价虚拟成交量: {vol:.0f}手"
+            f" (首段均量 {v_head:.0f}手 → 末段均量 {v_tail:.0f}手,"
+            f" {'放量' if v_tail > v_head * 1.2 else '缩量' if v_tail < v_head * 0.8 else '平稳'})\n"
+            f"7) 买卖余量: 买 {buy:.0f}手 / 卖 {sell:.0f}手 (买压 {sc['buy_ratio'] * 100:.0f}%)\n"
+            f"8) 撤单痕迹: 前段峰值 {p_early_peak:.2f} 到结束价回落 {fake:.2f}%"
+            f"({'疑似虚挂撤单' if fake >= 1.0 else '价格真实'}), 9:20后最低 {p_after_min:.2f}\n"
+            + ("\n".join(extra) + "\n" if extra else "")
+            + "9) 规则评分: " + ", ".join(f"{n}{s:+d}" for n, s, _ in sc["items"]) +
+            f"  合计 {sc['total']:+d}/10\n\n"
+            "【铁律】所有数字必须直接引用上面给出的数值, 禁止编造、改写或推算任何数字;"
+            "提到价格时只用'昨收价/起始价/结束价/今开/最新'的原文数值。\n"
+            "【输出格式】严格按下面四行写, 总长100~180字, 不要省略任何一行:\n"
+            "①综合研判: 偏多/中性/偏空\n"
+            "②理由: 2-3条, 每条引用具体数据(优先看量价配合与撤单痕迹)\n"
+            "③风险: 1-2条\n"
+            "④操作倾向: 买入/持有/观望/卖出\n"
+            "最后一行加: 不构成投资建议")
+        self._ai_cache[code] = ""
+        self._ai_busy.add(code)
+        self._render()
+
+        def work(c=code):
+            text, err = D.llm_ask(self.app.cfg, prompt,
+                                  system="你是谨慎的A股盘前分析助手, 观点要明确但不武断。")
+            result = err or text or "AI 无返回"
+            try:
+                self.win.after(0, lambda: self._ai_done(c, result))
+            except Exception:
+                self._ai_busy.discard(c)   # 窗口已关/主循环未运行: 静默结束
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _recent_auction(self, code: str, days: int = 5):
+        """读最近若干天的竞价存档, 汇总该股的缺口/买压(给 AI 当历史上下文)。"""
+        import glob as _glob
+        out = []
+        folder = os.path.join(getattr(self.app, "base_dir", ""), "auction_data")
+        for path in sorted(_glob.glob(os.path.join(folder, "*.json")), reverse=True)[:days]:
+            try:
+                d = json.load(open(path, "r", encoding="utf-8"))
+                st = (d.get("stocks") or {}).get(code)
+                if not st or not st.get("samples"):
+                    continue
+                pc = float(st.get("prev_close") or 0)
+                smp = st["samples"]
+                if pc <= 0:
+                    continue
+                gap = (float(smp[-1][1]) - pc) / pc * 100
+                b, s2 = float(smp[-1][3]), float(smp[-1][4])
+                ratio = b / (b + s2) * 100 if (b + s2) > 0 else 50.0
+                out.append("%s 缺口%+.2f%% 买压%.0f%%" % (d.get("date", "?")[5:], gap, ratio))
+            except Exception:
+                continue
+        return out
+
+    def _ai_done(self, code, text):
+        self._ai_busy.discard(code)
+        self._ai_cache[code] = text
+        self._render()
+        self._place()
 
     def _render_holdings(self):
         """持仓总览卡: 真实持仓每只两行 + 底部汇总(悬停行情条持仓段时显示)。"""
@@ -955,8 +1111,9 @@ class SettingsWindow(BaseDialog):
         self._build_repo(left)
         self._build_market(right)
         self._build_fees(right)
+        self._build_ai(right)
         self._build_shortcuts(right)
-        self._build_tips(right)
+        self._build_tips(left)           # 小提示放左列: 平衡两列高度, 视觉更舒服
         # 等子控件排布后再同步滚动区域
         self.win.after_idle(self._sync_scroll_region)
 
@@ -1311,6 +1468,10 @@ class SettingsWindow(BaseDialog):
         self.app.cfg.setdefault("fees", {})[key] = round(v, 8)
         self._apply()
 
+    def _set_cfg(self, key, value):
+        self.app.cfg[key] = value
+        self._apply()
+
     def _build_fees(self, parent):
         pal = self.pal
         sec = self.section(parent, "交易手续费")
@@ -1335,6 +1496,51 @@ class SettingsWindow(BaseDialog):
         tk.Label(sec, text="费用 = 佣金（不足起收按起收）＋ 卖出印花税（仅股票）",
                  bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(2, 10))
+
+    def _build_ai(self, parent):
+        """AI 研判(大模型)设置: 启用开关 / 服务商 / 接口 / 模型 / Key。"""
+        pal = self.pal
+        sec = self.section(parent, "AI 研判（大模型）")
+        r0 = self.row(sec, "自动研判")
+        sw = Switch(r0, bool(self.app.cfg.get("llm_enabled")),
+                    lambda v: self._set_cfg("llm_enabled", bool(v)), pal, self.S)
+        sw.pack(side="left")
+        tk.Label(r0, text="开启后: 9:25 后自动研判一次 + 评分卡出现「AI 研判」按钮",
+                 anchor="w", bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
+
+        prov = str(self.app.cfg.get("llm_provider") or "deepseek")
+        r1 = self.row(sec, "服务商")
+        seg = Segmented(r1, [("deepseek", "DeepSeek"), ("mimo", "MIMO"), ("custom", "自定义")],
+                        prov, self._set_llm_provider, pal, self.fonts, scale=self.S)
+        seg.pack(side="left")
+
+        def field(label, key, placeholder=""):
+            r = self.row(sec, label)
+            var = tk.StringVar(value=str(self.app.cfg.get(key) or ""))
+            ent = make_entry(r, pal, self.fonts, width=26, textvariable=var)
+            ent.pack(side="left", fill="x", expand=True, ipady=4)
+            if placeholder:
+                tk.Label(r, text=placeholder, bg=pal["panel_alt"], fg=pal["faint"],
+                         font=self.fonts.tiny()).pack(side="left", padx=(8, 0))
+            ent.bind("<Return>", lambda e, k=key, v=var: self._set_cfg(k, v.get().strip()))
+            ent.bind("<FocusOut>", lambda e, k=key, v=var: self._set_cfg(k, v.get().strip()))
+            return var
+
+        self._llm_base_var = field("接口地址", "llm_base")
+        self._llm_model_var = field("模型名", "llm_model")
+        self._llm_key_var = field("API Key", "llm_key", "或环境变量")
+
+    def _set_llm_provider(self, name: str):
+        preset = D.LLM_PRESETS.get(name) or {}
+        self.app.cfg["llm_provider"] = name
+        if preset.get("base"):
+            self.app.cfg["llm_base"] = preset["base"]
+        if preset.get("model"):
+            self.app.cfg["llm_model"] = preset["model"]
+        self._llm_base_var.set(self.app.cfg.get("llm_base") or "")
+        self._llm_model_var.set(self.app.cfg.get("llm_model") or "")
+        self._apply()
 
     def _build_shortcuts(self, parent):
         pal = self.pal

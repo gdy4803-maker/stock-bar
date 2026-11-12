@@ -956,6 +956,115 @@ def auction_score(samples, prev_close: float):
             "gap": gap, "buy_ratio": (buy / (buy + sell)) if (buy + sell) > 0 else 0.5}
 
 
+# ---------------- 大模型研判 ----------------
+LLM_PRESETS = {
+    "deepseek": {"base": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    "mimo": {"base": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.6-pro"},
+    "custom": {"base": "", "model": ""},
+}
+
+MCP_STOCK_URL = "http://82.156.17.205/cnstock/mcp"
+_mcp_cache: dict[str, tuple[float, str]] = {}      # code -> (时间, 文本)
+
+
+def mcp_stock_brief(code: str, timeout: float = 20.0, cache_sec: float = 1800.0):
+    """调用 mcp-cn-a-stock 的 brief 工具, 返回基本面+历史统计文本; 失败返回 None。
+
+    数据源: 公开 MCP 服务(streamable-http JSON-RPC), 免费; 含 PE/PB/股息率/ROE
+    与 5/20/60/120/240 日均价、振幅、涨跌幅 —— 正是 AI 研判缺的历史维度。
+    带 30 分钟缓存, 避免重复请求触发限流。
+    """
+    sym = (code or "").upper()
+    if not sym:
+        return None
+    now = __import__("time").time()
+    hit = _mcp_cache.get(sym)
+    if hit and now - hit[0] < cache_sec:
+        return hit[1]
+
+    def _rpc(method, params=None, rid=1):
+        body = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            body["params"] = params
+        req = urllib.request.Request(MCP_STOCK_URL,
+                                     data=json.dumps(body).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json, text/event-stream")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+        if not raw.strip():
+            return {}                    # notification 只回 202 无正文
+        # streamable-http: SSE("event: message\ndata: {...}") 或纯 JSON
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                return json.loads(line[5:].strip())
+        return json.loads(raw)
+
+    try:
+        _rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                            "clientInfo": {"name": "stockbar", "version": "1.0"}})
+        _rpc("notifications/initialized", {}, rid=None)
+        data = _rpc("tools/call", {"name": "brief",
+                                   "arguments": {"symbol": sym}}, rid=2)
+        text = ""
+        for item in (data.get("result", {}).get("content") or []):
+            if isinstance(item, dict) and item.get("type") == "text":
+                text += item.get("text", "")
+        text = text.strip()
+        if text:
+            _mcp_cache[sym] = (now, text)
+        return text or None
+    except Exception:
+        return None
+
+
+def llm_key(cfg=None) -> str:
+    """API Key: 优先 config.json 的 llm_key, 没有则读环境变量 STOCKBAR_LLM_KEY。"""
+    k = ""
+    if isinstance(cfg, dict):
+        k = str(cfg.get("llm_key") or "").strip()
+    return k or os.environ.get("STOCKBAR_LLM_KEY", "").strip()
+
+
+def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 30.0):
+    """调 OpenAI 兼容接口 /chat/completions, 返回文本; 失败返回 None。
+
+    配置: llm_enabled / llm_base / llm_model / llm_key(或环境变量)。
+    """
+    if not isinstance(cfg, dict) or not cfg.get("llm_enabled"):
+        return None, "未启用 AI 研判(设置里开启)"
+    key = llm_key(cfg)
+    if not key:
+        return None, "未配置 API Key(设置里填写, 或设置环境变量 STOCKBAR_LLM_KEY)"
+    base = str(cfg.get("llm_base") or "").strip().rstrip("/")
+    model = str(cfg.get("llm_model") or "").strip()
+    if not base:
+        preset = LLM_PRESETS.get(str(cfg.get("llm_provider") or "deepseek"))
+        base = (preset or {}).get("base", "")
+        model = model or (preset or {}).get("model", "")
+    if not base or not model:
+        return None, "接口地址/模型名未配置"
+    if not base.endswith("/chat/completions"):
+        base = base + "/chat/completions"
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msgs.append({"role": "user", "content": prompt})
+    body = json.dumps({"model": model, "messages": msgs,
+                       "temperature": 0.4, "max_tokens": 400}).encode("utf-8")
+    try:
+        req = urllib.request.Request(base, data=body, method="POST")
+        req.add_header("Authorization", "Bearer " + key)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", HEADERS["User-Agent"])
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return data["choices"][0]["message"]["content"].strip(), None
+    except Exception as exc:
+        return None, "AI 调用失败: %s" % (str(exc)[:120],)
+
+
 def fmt_money(value: float) -> str:
     try:
         return "{:,.2f}".format(float(value))

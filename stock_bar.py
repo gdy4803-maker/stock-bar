@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -597,6 +597,7 @@ class StockBar:
         self._hover_zone = "pick"
         self._hover_after = None
         self._auction_saved = ""         # 竞价数据当天是否已存盘
+        self._ai_auto_date = ""          # AI 研判当天是否已自动跑过
         self._error = False
         self._last_vals: dict[str, float | None] = {}
         self._flash: dict[str, float] = {}
@@ -1120,10 +1121,27 @@ class StockBar:
         self._card.code = code
         if kind == "auction":
             self._card.show_auction(code)
+            self._maybe_auto_ai()        # 9:25 后打开评分卡会自动研判(每天一次)
         elif kind == "holdings":
             self._card.show_holdings()
         else:
             self._card.show(code)
+
+    def _maybe_auto_ai(self):
+        """9:25 撮合后对"当前显示的那只"自动跑一次 AI 研判(每天只调一次)。"""
+        if not self.cfg.get("llm_enabled"):
+            return                        # 由「自动研判」开关统一控制
+        if getattr(self, "_ai_auto_date", "") == time.strftime("%Y-%m-%d"):
+            return                        # 今天已经自动跑过
+        t = time.localtime()
+        if t.tm_hour * 60 + t.tm_min < 9 * 60 + 25:
+            return                        # 还在竞价中, 等 9:25 撮合后
+        self._ai_auto_date = time.strftime("%Y-%m-%d")
+        code = self._current_pick_code()
+        if not code:
+            return
+        self._card.code = code
+        self._card._ask_ai()
 
     def _toggle_pnl_display(self):
         """点击持仓段: 切换 涨幅 / 金额 显示。"""
@@ -1309,6 +1327,7 @@ class StockBar:
         self.quotes.update(quotes)
         self._collect_auction(quotes)
         self._save_auction_data()        # 9:25 后静默存盘(每天一次)
+        self._maybe_auto_ai()            # 9:25 撮合后自动 AI 研判(每天一次)
         if self._error:
             self._error = False
         now = time.time()
@@ -1978,7 +1997,9 @@ def apply_update_from_staging(staging: str, app_dir: str, old_exe: str) -> int:
         except OSError:
             time.sleep(1)
     # 2) 覆盖 _internal(整体替换, 失败回滚), 其余文件直接复制
-    skip = {"config.json", "stock_bar.log", "stock_bar.lock", "update.log"}
+    #    用户数据一律不动: config/auction_data(竞价存档)/日志
+    skip = {"config.json", "stock_bar.log", "stock_bar.lock", "update.log",
+            "auction_data", "update_cache.json"}
     new_exe = os.path.basename(sys.executable)
     try:
         for name in sorted(os.listdir(staging)):
