@@ -219,9 +219,17 @@ class InfoCard:
         rows = sc["items"] if sc else []
         row_h = int(26 * S_)
         ai_on = bool(self.app.cfg.get("llm_enabled"))
-        ai_h = int(70 * S_) if ai_on else 0
-        if ai_on and self._ai_cache.get(code or ""):
-            ai_h += int(58 * S_)
+        ai_text = self._ai_cache.get(code or "")
+        ai_busy = (code or "") in self._ai_busy
+        # AI 文字按宽度估算行数, 动态给高度(限长防爆框)
+        if ai_text:
+            ai_text = ai_text if len(ai_text) <= 300 else ai_text[:300] + "…"
+            per_line = max(16, int((w - 2 * pad) / max(6, int(7 * S_))))
+            ai_lines = sum(max(1, (len(seg) + per_line - 1) // per_line)
+                           for seg in ai_text.split("\n"))
+            ai_h = int(64 * S_) + ai_lines * int(13 * S_)
+        else:
+            ai_h = int(70 * S_) if ai_on else 0
         h = int(96 * S_) + row_h * max(5, len(rows)) + int(64 * S_) + ai_h
         self.w, self.h = w, h
         c = self.canvas
@@ -241,7 +249,9 @@ class InfoCard:
         y += int(30 * S_)
 
         if not sc:
-            c.create_text(w / 2, y + int(40 * S_), text="暂无竞价数据\n(需在 9:15–9:25 采集)",
+            loaded = len(getattr(self.app, "_auction", {}) or {})
+            c.create_text(w / 2, y + int(40 * S_),
+                          text="暂无竞价数据(需 9:15–9:25 采集)\n当前已载入 %d 只股票的竞价数据" % loaded,
                           fill=pal["faint"], font=fonts.label(), justify="center")
             return
 
@@ -276,15 +286,13 @@ class InfoCard:
                       fill=pal["faint"], font=fonts.tiny())
         # AI 研判(启用后显示按钮; 结果按股票分开展示)
         self._ai_btn = None
-        ai_text = self._ai_cache.get(code or "")
-        ai_busy = (code or "") in self._ai_busy
         if sc and self.app.cfg.get("llm_enabled"):
             bh = int(26 * S_)
             bx2 = pad + int(96 * S_)
             by1 = y - int(18 * S_)
             by2 = by1 + bh
             draw_round_rect(c, pad, by1, bx2, by2, 6 * S_, pal["accent"], "", 1)
-            c.create_text((pad + bx2) / 2, (by1 + by2) / 2, text="AI 研判",
+            c.create_text((pad + bx2) / 2, (by1 + by2) / 2, text="AI 研判 [T]",
                           fill="#FFFFFF", font=fonts.tiny())
             self._ai_btn = (pad, by1, bx2, by2)
             if ai_text:
@@ -395,10 +403,15 @@ class InfoCard:
         threading.Thread(target=work, daemon=True).start()
 
     def _recent_auction(self, code: str, days: int = 5):
-        """读最近若干天的竞价存档, 汇总该股的缺口/买压(给 AI 当历史上下文)。"""
+        """读最近若干天的竞价存档, 汇总该股的缺口/买压(给 AI 当历史上下文)。
+
+        存档目录与程序分离(%LOCALAPPDATA%\\StockBar\\auction_data), 打包/升级不丢。
+        """
         import glob as _glob
         out = []
-        folder = os.path.join(getattr(self.app, "base_dir", ""), "auction_data")
+        app = self.app
+        folder = (app._auction_dir() if hasattr(app, "_auction_dir")
+                  else os.path.join(getattr(app, "base_dir", ""), "auction_data"))
         for path in sorted(_glob.glob(os.path.join(folder, "*.json")), reverse=True)[:days]:
             try:
                 d = json.load(open(path, "r", encoding="utf-8"))
@@ -755,10 +768,12 @@ class InfoCard:
         samples = [s for s in raw if str(s[0])[:8] == today and s[1] > 0]
         prev = q.prev_close or (samples[0][1] if samples else 0.0)
 
-        # 无采样: 提示等待
+        # 无采样: 提示等待(附诊断: 已载入多少只, 便于排查)
         if not samples:
-            c.create_text((x1 + x2) / 2, (y1 + y2) / 2, text="集合竞价采样中…",
-                          fill=pal["faint"], font=fonts.label())
+            loaded = len(getattr(self.app, "_auction", {}) or {})
+            c.create_text((x1 + x2) / 2, (y1 + y2) / 2,
+                          text="暂无竞价数据(需 9:15–9:25 采集)\n当前已载入 %d 只" % loaded,
+                          fill=pal["faint"], font=fonts.label(), justify="center")
             return
 
         prices = [s[1] for s in samples]
@@ -1114,6 +1129,7 @@ class SettingsWindow(BaseDialog):
         self._build_ai(right)
         self._build_shortcuts(right)
         self._build_tips(left)           # 小提示放左列: 平衡两列高度, 视觉更舒服
+        self._bind_autosave()            # 输入框打字即自动保存(不用切焦点)
         # 等子控件排布后再同步滚动区域
         self.win.after_idle(self._sync_scroll_region)
 
@@ -1413,6 +1429,12 @@ class SettingsWindow(BaseDialog):
         Segmented(r, [(v, f"{v:g}s") for v in self.app.INTERVALS],
                   float(self.app.cfg["interval_seconds"]), self._set_interval,
                   pal, self.fonts, item_pad=9, min_item=38).pack(side="left")
+        r = self.row(sec, "请求时段")
+        Segmented(r, [("trading", "交易时段 9-16点"), ("all", "全天请求")],
+                  self.app.cfg.get("fetch_mode", "trading"), self._set_fetch_mode,
+                  pal, self.fonts).pack(side="left")
+        tk.Label(r, text="收盘后不打接口, 省资源", bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "右侧指数")
         self.index_var = tk.StringVar(value=self.app.cfg["index"])
         entry = make_entry(r, pal, self.fonts, width=10, textvariable=self.index_var,
@@ -1470,6 +1492,10 @@ class SettingsWindow(BaseDialog):
 
     def _set_cfg(self, key, value):
         self.app.cfg[key] = value
+        self._apply()
+
+    def _set_fetch_mode(self, value):
+        self.app.cfg["fetch_mode"] = value
         self._apply()
 
     def _build_fees(self, parent):
@@ -1588,6 +1614,51 @@ class SettingsWindow(BaseDialog):
                      width=84, height=32, scale=self.S).pack(side="right")
 
     # ---- 回调 ----
+    def _bind_autosave(self):
+        """给设置里所有输入框绑定"打字即保存"(防抖 0.6 秒), 不必切焦点。"""
+        def walk(w):
+            for ch in w.winfo_children():
+                if isinstance(ch, tk.Entry):
+                    ch.bind("<KeyRelease>", self._on_entry_edit, add="+")
+                walk(ch)
+        walk(self.win)
+        self._autosave_job = None
+
+    def _on_entry_edit(self, _event=None):
+        if getattr(self, "_autosave_job", None):
+            try:
+                self.win.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+        try:
+            self._autosave_job = self.win.after(600, self._flush_inputs)
+        except tk.TclError:
+            self._autosave_job = None
+
+    def _flush_inputs(self):
+        """把所有输入框的当前值写回配置并应用。"""
+        self._autosave_job = None
+        try:
+            for name in ("index_var", "_llm_base_var", "_llm_model_var", "_llm_key_var"):
+                var = getattr(self, name, None)
+                if var is not None:
+                    key = {"index_var": "index", "_llm_base_var": "llm_base",
+                           "_llm_model_var": "llm_model", "_llm_key_var": "llm_key"}[name]
+                    if key == "index":
+                        continue     # 指数走 _apply_index(有校验)
+                    self.app.cfg[key] = var.get().strip()
+            for key, var in (getattr(self, "fee_vars", {}) or {}).items():
+                try:
+                    v = float(var.get() or 0)
+                except ValueError:
+                    continue
+                if key in self._FEE_WAN:
+                    v = v / 10000.0
+                self.app.cfg.setdefault("fees", {})[key] = max(0.0, round(v, 8))
+            self._apply()
+        except Exception:
+            pass
+
     def _apply(self):
         self.app.apply_settings()
 

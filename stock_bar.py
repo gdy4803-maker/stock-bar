@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -678,6 +678,8 @@ class StockBar:
         self.input.bind("<Key-1>", lambda e: self._card_view("stock"))
         self.input.bind("<Key-2>", lambda e: self._card_view("holdings"))
         self.input.bind("<Key-3>", lambda e: self._card_view("auction"))
+        self.input.bind("<Key-t>", lambda e: self._ai_now())
+        self.input.bind("<Key-T>", lambda e: self._ai_now())
         self.input.bind("<Control-Shift-S>", lambda e: self.open_settings())
         self.input.bind("<Control-m>", lambda e: self.open_manage())
         self.input.bind("<Control-h>", lambda e: self.open_holdings())
@@ -685,6 +687,7 @@ class StockBar:
         self.input.bind("<F5>", lambda e: self.reload_config())
 
         self._load_lists()
+        self._load_auction_cache()     # 载入今日竞价存档(重启后评分卡立即可用)
         self._card = sb_ui.InfoCard(self)
         self._render_bar(force=True)
         self._restack_bar()
@@ -1110,6 +1113,17 @@ class StockBar:
         self._render_bar(force=True)
         self.root.after(320, lambda: self._render_bar(force=True))
 
+    def _ai_now(self):
+        """快捷键 T: 竞价评分卡 + 立即 AI 研判(需悬浮行情条上)。"""
+        if not self._hovering:
+            return
+        code = self._current_pick_code()
+        if not code:
+            return
+        self._card.code = code
+        self._card.show_auction(code)
+        self._card._ask_ai()
+
     def _card_view(self, kind: str):
         """快捷键 1/2/3: 切换详情卡视图(个股 / 持仓总览 / 竞价评分)。
         仅在鼠标悬浮行情条上时生效; 鼠标移开卡片照常消失。"""
@@ -1166,6 +1180,14 @@ class StockBar:
             px, py = self.root.winfo_pointerxy()
             x, y, w, h = self.bar_rect()
             inside = x <= px <= x + w and y <= py <= y + h
+            # 鼠标在卡片上也算"未离开"(否则无法点击卡片里的按钮)
+            if not inside and self._card and self._card.visible:
+                try:
+                    cx, cy = self._card.win.winfo_rootx(), self._card.win.winfo_rooty()
+                    if cx <= px <= cx + self._card.w and cy <= py <= cy + self._card.h:
+                        inside = True
+                except tk.TclError:
+                    pass
             if inside:
                 rel = px - x
                 if rel >= (self._index_zone_left or w):
@@ -1252,11 +1274,27 @@ class StockBar:
                                         daemon=True)
         self._worker.start()
 
+    def _fetch_allowed(self) -> bool:
+        """请求时段检查: 'trading'=交易日 9:00–16:00 才请求; 'all'=全天请求。
+
+        非请求时段不打接口(省请求/省电), 但界面保持上次数据不动。
+        """
+        if (self.cfg or {}).get("fetch_mode", "trading") != "trading":
+            return True
+        t = time.localtime()
+        if t.tm_wday >= 5:                 # 周末不交易, 不请求
+            return False
+        mins = t.tm_hour * 60 + t.tm_min
+        return 9 * 60 <= mins < 16 * 60
+
     def _worker_loop(self, gen: int, codes: list[str], index_code: str,
                      interval: float, stop: threading.Event):
         failures = 0
         while not stop.is_set():
             started = time.time()
+            if not self._fetch_allowed():
+                stop.wait(20.0)            # 非请求时段: 只等待, 不打接口
+                continue
             try:
                 quotes = D.fetch_quotes(codes, index_codes=[index_code], timeout=6.0)
                 if quotes:
@@ -1444,6 +1482,65 @@ class StockBar:
             if len(arr) > 800:                # 上限保护(10 分钟足够)
                 del arr[:len(arr) - 800]
 
+    def _auction_dir(self) -> str:
+        """竞价存档目录: 程序目录下的 auction_data(与之前一致)。
+
+        首次使用会把 %LOCALAPPDATA%\\StockBar 的存档合并回来(取样本多的一份),
+        打包/升级由 tools\\build.ps1 与升级跳过清单保证不丢。
+        """
+        d = os.path.join(BASE_DIR, "auction_data")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        # 兼容: 曾短暂存到 %LOCALAPPDATA%, 把那边的数据合并回来
+        alt = os.path.join(os.environ.get("LOCALAPPDATA") or "", "StockBar", "auction_data")
+        if os.path.isdir(alt) and os.path.abspath(alt) != os.path.abspath(d):
+            try:
+                for name in os.listdir(alt):
+                    if not name.endswith(".json"):
+                        continue
+                    src_p, dst_p = os.path.join(alt, name), os.path.join(d, name)
+                    if not os.path.exists(dst_p):
+                        shutil.copy2(src_p, dst_p)
+                        continue
+                    a = json.load(open(dst_p, "r", encoding="utf-8"))
+                    b = json.load(open(src_p, "r", encoding="utf-8"))
+                    merged = (a.get("stocks") or {})
+                    for code, st in (b.get("stocks") or {}).items():
+                        cur = merged.get(code)
+                        if not cur or len(st.get("samples") or []) > len(cur.get("samples") or []):
+                            merged[code] = st
+                    a["stocks"] = merged
+                    with open(dst_p, "w", encoding="utf-8") as f:
+                        json.dump(a, f, ensure_ascii=False)
+            except Exception:
+                pass
+        return d
+
+    def _load_auction_cache(self):
+        """启动时把今天的竞价存档载入内存 —— 重启后评分卡/AI 立即可用,
+        不用等到明天 9:15 重新采样。"""
+        try:
+            folder = self._auction_dir()
+            path = os.path.join(folder, time.strftime("%Y-%m-%d") + ".json")
+            if not os.path.exists(path):
+                self._log("竞价存档: 无今日文件 %s" % path)
+                return
+            d = json.load(open(path, "r", encoding="utf-8"))
+            today = time.strftime("%Y%m%d")
+            n = 0
+            for code, st in (d.get("stocks") or {}).items():
+                arr = [(s[0], s[1], s[2], s[3], s[4])
+                       for s in (st.get("samples") or []) if len(s) >= 5]
+                if arr:
+                    self._auction[code] = arr
+                    n += 1
+            self._log("竞价存档: 载入 %d 只(共 %d 只) 路径=%s"
+                      % (n, len(d.get("stocks") or {}), path))
+        except Exception as exc:
+            self._log("竞价存档载入失败: %s" % repr(exc)[:120])
+
     def _save_auction_data(self, force: bool = False):
         """9:25 后把当天竞价采样存盘(静默攒数据, 供日后训练评分权重)。
 
@@ -1457,8 +1554,7 @@ class StockBar:
             return
         today = time.strftime("%Y-%m-%d")
         try:
-            folder = os.path.join(BASE_DIR, "auction_data")
-            os.makedirs(folder, exist_ok=True)
+            folder = self._auction_dir()
             path = os.path.join(folder, today + ".json")
             out = {"date": today, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "stocks": {}}
