@@ -213,24 +213,35 @@ class InfoCard:
         w = int(self.WIDTH * S_ * 1.12)
         pad = int(16 * S_)
         today = time.strftime("%Y%m%d")
-        samples = [s for s in (getattr(self.app, "_auction", {}) or {}).get(code, [])
-                   if str(s[0])[:8] == today]
-        sc = D.auction_score(samples, q.prev_close if q else 0.0)
+        raw = (getattr(self.app, "_auction", {}) or {}).get(code, [])
+        samples = [s for s in raw if str(s[0])[:8] == today]
+        day_label = "今日"
+        if not samples:
+            days = sorted({str(s[0])[:8] for s in raw})
+            if days:
+                d = days[-1]
+                samples = [s for s in raw if str(s[0])[:8] == d]
+                day_label = "%s/%s/%s" % (d[:4], d[4:6], d[6:])
+        # 昨收: 优先行情, 行情为空(如收盘后不请求)时用存档里的昨收兜底
+        prev = q.prev_close if (q and q.prev_close) else \
+            float((getattr(self.app, "_auction_prev", {}) or {}).get(code) or 0)
+        sc = D.auction_score(samples, prev,
+                             getattr(self.app, "_score_weights", None))
         rows = sc["items"] if sc else []
         row_h = int(26 * S_)
         ai_on = bool(self.app.cfg.get("llm_enabled"))
         ai_text = self._ai_cache.get(code or "")
         ai_busy = (code or "") in self._ai_busy
-        # AI 文字按宽度估算行数, 动态给高度(限长防爆框)
+        # AI 文字按宽度估算行数, 动态给高度(不再截断, 全文显示; 仅防极端长度)
         if ai_text:
-            ai_text = ai_text if len(ai_text) <= 300 else ai_text[:300] + "…"
+            ai_text = ai_text if len(ai_text) <= 1200 else ai_text[:1200] + "…"
             per_line = max(16, int((w - 2 * pad) / max(6, int(7 * S_))))
             ai_lines = sum(max(1, (len(seg) + per_line - 1) // per_line)
                            for seg in ai_text.split("\n"))
             ai_h = int(64 * S_) + ai_lines * int(13 * S_)
         else:
             ai_h = int(70 * S_) if ai_on else 0
-        h = int(96 * S_) + row_h * max(5, len(rows)) + int(64 * S_) + ai_h
+        h = int(96 * S_) + int(22 * S_) + row_h * max(5, len(rows)) + int(64 * S_) + ai_h
         self.w, self.h = w, h
         c = self.canvas
         c.configure(width=w, height=h)
@@ -244,7 +255,8 @@ class InfoCard:
         _text_run(c, pad, y, [
             (name, fonts.label(), pal["text"]),
             ("  " + (D.code_digits(code) if code else ""), fonts.tiny(), pal["faint"]),
-            ("   竞价评分", fonts.tiny(), pal["muted"]),
+            ("   竞价评分" + ("" if day_label == "今日" else " · " + day_label),
+             fonts.tiny(), pal["muted"]),
         ])
         y += int(30 * S_)
 
@@ -256,14 +268,40 @@ class InfoCard:
             return
 
         tone = {"pos": pal["pos"], "neg": pal["neg"]}.get(sc["tone"], pal["text_dim"])
-        # 总分
+        # 总分(左=规则评分, 右=规则结论)
         c.create_text(pad, y, text=("%+d" % sc["total"]), anchor="w",
                       fill=tone, font=fonts.num(16, True))
-        c.create_text(pad + int(52 * S_), y + int(3 * S_), text="/ 10",
+        c.create_text(pad + int(52 * S_), y + int(3 * S_), text="/ 10  规则评分",
                       anchor="w", fill=pal["faint"], font=fonts.tiny())
         c.create_text(w - pad, y, text=sc["verdict"], anchor="e",
                       fill=tone, font=fonts.label())
-        y += int(38 * S_)
+        y += int(30 * S_)
+        # AI 结论对照行(与规则评分并列; 未跑时给出提示)
+        ai_text = self._ai_cache.get(code or "")
+        if ai_text:
+            ai_view = ""
+            for seg in ai_text.split("\n"):
+                if "偏多" in seg or "中性" in seg or "偏空" in seg:
+                    ai_view = seg.strip()
+                    break
+            ai_tone = (pal["pos"] if "偏多" in ai_view
+                       else pal["neg"] if "偏空" in ai_view else pal["text_dim"])
+            same = (("偏多" in ai_view and sc["tone"] == "pos")
+                    or ("偏空" in ai_view and sc["tone"] == "neg")
+                    or ("中性" in ai_view and sc["tone"] == "flat"))
+            c.create_text(pad, y, text="AI 研判", anchor="w", fill=pal["faint"],
+                          font=fonts.tiny())
+            c.create_text(pad + int(64 * S_), y,
+                          text=(ai_view[:42] if ai_view else "已研判(详见下方)"),
+                          anchor="w", fill=ai_tone, font=fonts.tiny())
+            if not same:
+                c.create_text(w - pad, y, text="⚠ 与规则不一致", anchor="e",
+                              fill=pal["warn"], font=fonts.tiny())
+        else:
+            c.create_text(pad, y,
+                          text="AI 研判: 未运行 —— 悬浮行情条按 T 开始",
+                          anchor="w", fill=pal["faint"], font=fonts.tiny())
+        y += int(22 * S_)
 
         # 五项明细
         c.create_line(pad, y, w - pad, y, fill=pal["border_soft"])
@@ -316,9 +354,20 @@ class InfoCard:
             return
         q = self.app.quotes.get(code)
         today = time.strftime("%Y%m%d")
-        samples = [s for s in (getattr(self.app, "_auction", {}) or {}).get(code, [])
-                   if str(s[0])[:8] == today]
-        sc = D.auction_score(samples, q.prev_close if q else 0.0)
+        raw = (getattr(self.app, "_auction", {}) or {}).get(code, [])
+        samples = [s for s in raw if str(s[0])[:8] == today]
+        day_label = "今日"
+        if not samples:
+            days = sorted({str(s[0])[:8] for s in raw})
+            if days:
+                d = days[-1]
+                samples = [s for s in raw if str(s[0])[:8] == d]
+                day_label = "%s/%s/%s" % (d[:4], d[4:6], d[6:])
+        # 昨收: 优先行情, 行情为空(如收盘后不请求)时用存档里的昨收兜底
+        prev = q.prev_close if (q and q.prev_close) else \
+            float((getattr(self.app, "_auction_prev", {}) or {}).get(code) or 0)
+        sc = D.auction_score(samples, prev,
+                             getattr(self.app, "_score_weights", None))
         if not sc or not q:
             self._ai_cache[code] = "暂无竞价数据, 无法研判"
             self._render()
@@ -358,10 +407,10 @@ class InfoCard:
             extra.append(f"- 开盘后实况: 今开 {q.open:.2f}, 最新 {q.price:.2f}"
                          f"({q.pct:+.2f}%), 成交 {D.fmt_volume(q.volume)}手,"
                          f"成交额 {D.fmt_yi_wan(q.amount * 10000)}")
-        # 历史统计 + 基本面(来自公开 MCP 数据服务)
-        brief = D.mcp_stock_brief(code)
+        # 历史统计 + 基本面 + 技术分析(来自开源 MCP 数据服务 full 级别)
+        brief = D.mcp_stock_brief(code, level="full")
         if brief:
-            extra.append("- 该股基本面与历史统计(数据源 mcp-cn-a-stock):\n" + brief)
+            extra.append("- 该股基本面/历史统计/技术分析(数据源 mcp-cn-a-stock):\n" + brief)
         prompt = (
             "你是A股盘前研判助手。以下是【真实行情数据】, 请只依据这些数据研判:\n"
             f"1) 股票: {q.name}({code})\n"
@@ -383,7 +432,8 @@ class InfoCard:
             "提到价格时只用'昨收价/起始价/结束价/今开/最新'的原文数值。\n"
             "【输出格式】严格按下面四行写, 总长100~180字, 不要省略任何一行:\n"
             "①综合研判: 偏多/中性/偏空\n"
-            "②理由: 2-3条, 每条引用具体数据(优先看量价配合与撤单痕迹)\n"
+            "②理由: 2-3条, 每条引用具体数据; 【至少一条为非方向性因素】"
+            "(估值分位/技术超买超卖/风险收益比), 不要只说'因为涨了所以强'\n"
             "③风险: 1-2条\n"
             "④操作倾向: 买入/持有/观望/卖出\n"
             "最后一行加: 不构成投资建议")
@@ -392,8 +442,17 @@ class InfoCard:
         self._render()
 
         def work(c=code):
-            text, err = D.llm_ask(self.app.cfg, prompt,
-                                  system="你是谨慎的A股盘前分析助手, 观点要明确但不武断。")
+            text, err = D.llm_ask(
+                self.app.cfg, prompt,
+                system=("你是谨慎的A股盘前分析助手, 观点要明确但不武断。\n"
+                        "【重要原则】\n"
+                        "1) 不得简单地'涨了就持有、跌了就卖出' —— 当日方向只是参考之一。\n"
+                        "2) 必须综合考虑: 估值分位(PE/PB 高低)、技术超买超卖(KDJ/RSI 高低位)、"
+                        "趋势与估值是否背离、风险收益比。\n"
+                        "3) 当价格方向与估值/技术面矛盾时, 敢于给出与方向相反的建议"
+                        "(例如高开+严重超买 → 即便涨也建议观望/减仓; 低位+超卖+估值合理 → "
+                        "即便跌也可建议持有/低吸)。\n"
+                        "4) 理由中至少一条引用非方向性因素(估值/技术位置/风险收益比)。"))
             result = err or text or "AI 无返回"
             try:
                 self.win.after(0, lambda: self._ai_done(c, result))
@@ -664,7 +723,7 @@ class InfoCard:
             elif phase:
                 t1, t2 = "09:15", "09:25"
             else:
-                t1, t2 = self._first_time(), self._last_time()
+                t1, t2 = "09:30", "15:00"      # 分时横轴固定交易时段(同花顺式)
             c.create_text(pad, p["time"] + 8 * S, text=t1, anchor="w",
                           fill=pal["faint"], font=fonts.tiny())
             c.create_text(w - pad, p["time"] + 8 * S, text=t2, anchor="e",
@@ -909,6 +968,20 @@ class InfoCard:
         if len(pts) > 180:
             step = len(pts) / 180.0
             pts = [pts[min(len(pts) - 1, int(i * step))] for i in range(180)]
+
+        def _xmin(t):
+            """HH:MM -> 交易分钟序(9:30=0, 11:30=120, 13:00=120, 15:00=240)。"""
+            try:
+                hh, mm = int(t[:2]), int(t[3:5])
+            except Exception:
+                return 0
+            mins = hh * 60 + mm
+            if mins <= 11 * 60 + 30:
+                return max(0, mins - (9 * 60 + 30))
+            if mins < 13 * 60:
+                return 120                        # 午休压缩
+            return min(240, 120 + mins - (13 * 60))
+
         if len(pts) < 2:
             # 集合竞价/刚开盘只有 1 个点: 画一个点即可, 直接 create_line 会因坐标不足抛异常
             if pts:
@@ -924,29 +997,46 @@ class InfoCard:
             return
         prices = [v for _t, v in pts]
         prev = q.prev_close or series.prev_close or prices[0]
-        lo = min(min(prices), prev)
-        hi = max(max(prices), prev)
-        if hi - lo < 1e-9:
-            hi = lo + 0.01
-            lo -= 0.01
-        span = (hi - lo) * 1.12
-        mid = (hi + lo) / 2
-        lo, hi = mid - span / 2, mid + span / 2
-        n = len(pts)
+        hi_v, lo_v = max(prices), min(prices)
+        # 纵轴(同花顺式): 以昨收为中心对称, 范围随最高/最低点变化
+        dev = max(abs(hi_v - prev), abs(lo_v - prev))
+        if dev < 1e-9:
+            dev = max(abs(prev) * 0.002, 0.01)
+        dev *= 1.18
+        lo, hi = prev - dev, prev + dev
+        # X 按时间映射到固定 9:30–15:00(未到的时间留白)
         coords = []
-        for i, (_t, v) in enumerate(pts):
-            px = x1 + (x2 - x1) * (i / max(1, n - 1))
+        for t, v in pts:
+            px = x1 + (x2 - x1) * (_xmin(t) / 240.0)
             py = y2 - (v - lo) / (hi - lo) * (y2 - y1)
             coords += [px, py]
-        area = coords + [x2, y2, x1, y2]
+        last_x = coords[-2]
+        area = coords + [last_x, y2, x1, y2]
         c.create_polygon(*area, fill=soft, outline="")
         if q.prev_close:
             py = y2 - (q.prev_close - lo) / (hi - lo) * (y2 - y1)
-            c.create_line(x1, py, x2, py, fill=pal["border"], dash=(3, 3))
+            # 昨收虚线(同花顺式): 明显可见 + 标注价格
+            c.create_line(x1, py, x2, py, fill=pal["muted"], dash=(4, 3),
+                          width=max(1, int(1.1 * S)))
+            c.create_text(x1 + int(3 * S), py - int(3 * S),
+                          text="昨收 " + D.fmt_price(q.prev_close, q.dp),
+                          anchor="sw", fill=pal["muted"], font=fonts.tiny())
         c.create_line(*coords, fill=color, width=max(1, int(1.6 * S)))
         c.create_oval(coords[-2] - 2.6 * S, coords[-1] - 2.6 * S,
                       coords[-2] + 2.6 * S, coords[-1] + 2.6 * S,
                       fill=color, outline=pal["card_bg"])
+        # 最高/最低点标注(点 + 价格, 同花顺式)
+        i_hi = prices.index(hi_v)
+        i_lo = prices.index(lo_v)
+        for idx, val, col, dy in ((i_hi, hi_v, pal["pos"], -int(13 * S)),
+                                  (i_lo, lo_v, pal["neg"], int(4 * S))):
+            px = coords[idx * 2]
+            py = coords[idx * 2 + 1]
+            c.create_oval(px - 2.2 * S, py - 2.2 * S, px + 2.2 * S, py + 2.2 * S,
+                          fill=col, outline="")
+            c.create_text(px, py + dy, text=D.fmt_price(val, q.dp),
+                          anchor="s" if dy < 0 else "n", fill=col,
+                          font=fonts.tiny())
 
     def _place(self):
         if not self.w:

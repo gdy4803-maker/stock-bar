@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -582,6 +582,8 @@ class StockBar:
         self._gen = 0
         self._last_msg_at = time.time()      # 看门狗: 最近一次收到取数线程消息的时间
         self._auction: dict[str, list] = {}  # 集合竞价采样 {code: [(时间戳, 虚拟撮合价), ...]}
+        self._auction_prev: dict[str, float] = {}   # 存档里的昨收(行情为空时兜底)
+        self._score_weights = None         # 训练出的评分权重(无则用启发式)
         self._update_info = None             # 发现的新版本 {tag,url,size}
         self._update_stage = ""              # 更新进度文案
         self._update_check_state = ""        # "" 未检查 | ok 成功 | fail 失败(限流/网络)
@@ -688,6 +690,7 @@ class StockBar:
 
         self._load_lists()
         self._load_auction_cache()     # 载入今日竞价存档(重启后评分卡立即可用)
+        self._maybe_train_weights()    # 攒够样本自动训练评分权重(越用越准)
         self._card = sb_ui.InfoCard(self)
         self._render_bar(force=True)
         self._restack_bar()
@@ -1365,6 +1368,7 @@ class StockBar:
         self.quotes.update(quotes)
         self._collect_auction(quotes)
         self._save_auction_data()        # 9:25 后静默存盘(每天一次)
+        self._backfill_labels()          # 收盘后补当日涨跌标签(训练用)
         self._maybe_auto_ai()            # 9:25 撮合后自动 AI 研判(每天一次)
         if self._error:
             self._error = False
@@ -1519,27 +1523,124 @@ class StockBar:
         return d
 
     def _load_auction_cache(self):
-        """启动时把今天的竞价存档载入内存 —— 重启后评分卡/AI 立即可用,
-        不用等到明天 9:15 重新采样。"""
+        """启动时把最近几天的竞价存档载入内存 —— 重启后评分卡/AI 立即可用,
+        当天没采到时也能显示"最近一次"的评分(如早盘前)。"""
         try:
             folder = self._auction_dir()
-            path = os.path.join(folder, time.strftime("%Y-%m-%d") + ".json")
-            if not os.path.exists(path):
-                self._log("竞价存档: 无今日文件 %s" % path)
-                return
-            d = json.load(open(path, "r", encoding="utf-8"))
-            today = time.strftime("%Y%m%d")
+            files = sorted([f for f in os.listdir(folder) if f.endswith(".json")],
+                           reverse=True)[:3]        # 最近 3 天
             n = 0
-            for code, st in (d.get("stocks") or {}).items():
-                arr = [(s[0], s[1], s[2], s[3], s[4])
-                       for s in (st.get("samples") or []) if len(s) >= 5]
-                if arr:
-                    self._auction[code] = arr
+            for name in files:
+                path = os.path.join(folder, name)
+                try:
+                    d = json.load(open(path, "r", encoding="utf-8"))
+                except Exception:
+                    continue
+                for code, st in (d.get("stocks") or {}).items():
+                    arr = [(s[0], s[1], s[2], s[3], s[4])
+                           for s in (st.get("samples") or []) if len(s) >= 5]
+                    if not arr:
+                        continue
+                    cur = self._auction.get(code) or []
+                    # 合并并按时间去重(存档里的优先保留)
+                    seen = {s[0] for s in arr}
+                    self._auction[code] = arr + [s for s in cur if s[0] not in seen]
+                    try:
+                        self._auction_prev[code] = float(st.get("prev_close") or 0)
+                    except (TypeError, ValueError):
+                        pass
                     n += 1
-            self._log("竞价存档: 载入 %d 只(共 %d 只) 路径=%s"
-                      % (n, len(d.get("stocks") or {}), path))
+            self._log("竞价存档: 载入 %d 项(最近 %d 天) 路径=%s" % (n, len(files), folder))
         except Exception as exc:
             self._log("竞价存档载入失败: %s" % repr(exc)[:120])
+
+    def _backfill_labels(self):
+        """补训练标签: 收盘后把"当日涨跌幅"写入当天存档(供越用越准的训练)。"""
+        t = time.localtime()
+        if t.tm_hour * 60 + t.tm_min < 15 * 60:
+            return                        # 收盘后才补
+        try:
+            path = os.path.join(self._auction_dir(), time.strftime("%Y-%m-%d") + ".json")
+            if not os.path.exists(path):
+                return
+            d = json.load(open(path, "r", encoding="utf-8"))
+            changed = False
+            for code, st in (d.get("stocks") or {}).items():
+                if st.get("day_pct") is not None:
+                    continue
+                q = self.quotes.get(code)
+                if q and D.quote_is_today(q):
+                    st["day_pct"] = round(float(q.pct or 0), 4)
+                    st["day_close"] = round(float(q.price or 0), 4)
+                    changed = True
+            if changed:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False)
+                self._log("已补充当日涨跌标签")
+        except Exception:
+            pass
+
+    def _maybe_train_weights(self):
+        """攒够样本后自动训练评分权重(纯 Python 逻辑回归, 不依赖第三方库)。
+
+        触发: 启动时; 新增可用样本 >= 30 且距上次训练 >= 1 天。
+        结果存 auction_data\\weights.json; 样本不足/失败则继续用内置启发式权重。
+        """
+        try:
+            folder = self._auction_dir()
+            wpath = os.path.join(folder, "weights.json")
+            rows = []
+            for name in sorted(os.listdir(folder)):
+                if not name.endswith(".json") or name == "weights.json":
+                    continue
+                try:
+                    d = json.load(open(os.path.join(folder, name), "r", encoding="utf-8"))
+                except Exception:
+                    continue
+                for code, st in (d.get("stocks") or {}).items():
+                    if st.get("day_pct") is None:
+                        continue              # 无标签, 跳过
+                    smp = st.get("samples") or []
+                    pc = float(st.get("prev_close") or 0)
+                    if pc <= 0 or len(smp) < 2:
+                        continue
+                    sc = D.auction_score(smp, pc)
+                    if not sc:
+                        continue
+                    feats = [x[1] for x in sc["items"]]
+                    label = 1 if float(st.get("day_pct") or 0) > 0 else 0
+                    rows.append((feats, label))
+            # 上次训练时间控制(避免每次启动都训)
+            last = 0.0
+            if os.path.exists(wpath):
+                try:
+                    last = float(json.load(open(wpath, "r", encoding="utf-8")).get("trained_at") or 0)
+                except Exception:
+                    last = 0.0
+            if len(rows) < 60 or (time.time() - last) < 86400:
+                if os.path.exists(wpath):
+                    try:
+                        wt = json.load(open(wpath, "r", encoding="utf-8")).get("weights")
+                        if wt and len(wt) >= 6:
+                            self._score_weights = [float(x) for x in wt]
+                    except Exception:
+                        pass
+                return
+            weights = D.train_logistic(rows)
+            if not weights:
+                return
+            old_acc = D.model_accuracy(rows, None)
+            new_acc = D.model_accuracy(rows, weights)
+            with open(wpath, "w", encoding="utf-8") as f:
+                json.dump({"weights": weights, "samples": len(rows),
+                           "accuracy": round(new_acc, 4),
+                           "baseline_accuracy": round(old_acc, 4),
+                           "trained_at": time.time()}, f, ensure_ascii=False)
+            self._score_weights = weights
+            self._log("评分权重已训练: %d 样本, 准确率 %.1f%%(原 %.1f%%)"
+                      % (len(rows), new_acc * 100, old_acc * 100))
+        except Exception as exc:
+            self._log("权重训练失败: %s" % repr(exc)[:120])
 
     def _save_auction_data(self, force: bool = False):
         """9:25 后把当天竞价采样存盘(静默攒数据, 供日后训练评分权重)。
@@ -2005,6 +2106,7 @@ class StockBar:
     def quit(self):
         self._log("用户退出")
         self._save_auction_data(force=True)   # 退出兜底: 未到 9:25 也先把采样存下
+        self._backfill_labels()               # 退出前补一次标签
         self._stop.set()
         self._cancel_pollers()
         try:

@@ -844,11 +844,12 @@ def fmt_yi_wan(value: float) -> str:
 
 
 # ---------------- 集合竞价评分 ----------------
-def auction_score(samples, prev_close: float):
+def auction_score(samples, prev_close: float, weights=None):
     """集合竞价评分(-10 ~ +10): 返回 {"total","items","verdict","tone"}。
 
     samples: [(时间戳, 虚拟撮合价, 虚拟撮合量, 买余量, 卖余量), ...]
-    每项 -2 ~ +2 并附依据文字 —— 评分透明可核对, 不是黑箱结论。
+    weights: 可选 [w1..w5, b] —— 用历史数据训练出的权重(逻辑回归);
+    不传则用内置启发式权重。每项 -2 ~ +2 并附依据文字, 评分透明可核对。
     """
     if not samples or prev_close <= 0:
         return None
@@ -944,7 +945,14 @@ def auction_score(samples, prev_close: float):
         s5, d5 = 0, f"波动 {wave:.2f}%, 常规"
     items.append(("价格稳定", s5, d5))
 
-    total = sum(x[1] for x in items)
+    scores = [x[1] for x in items]
+    if weights and len(weights) >= 6:
+        # 训练权重(逻辑回归): total = Σ w_i * score_i + b, 映射到 -10..+10
+        z = sum(w * s for w, s in zip(weights[:5], scores)) + weights[5]
+        prob = 1.0 / (1.0 + __import__("math").exp(-max(-30.0, min(30.0, z))))
+        total = int(round((prob - 0.5) * 20))
+    else:
+        total = sum(scores)                     # 内置启发式: 各项直接相加
     total = max(-10, min(10, total))
     if total >= 4:
         verdict, tone = "偏多：可买入/持有", "pos"
@@ -954,6 +962,53 @@ def auction_score(samples, prev_close: float):
         verdict, tone = "中性：观望为宜", "flat"
     return {"total": total, "items": items, "verdict": verdict, "tone": tone,
             "gap": gap, "buy_ratio": (buy / (buy + sell)) if (buy + sell) > 0 else 0.5}
+
+
+def train_logistic(rows, lr: float = 0.25, epochs: int = 400):
+    """纯 Python 逻辑回归训练 —— 样本小(几百条×5特征), 无需 numpy/sklearn。
+
+    rows: [([s1..s5], label 0/1), ...]  其中 s_i = 各项得分(-2..2),
+    label = 当日涨幅>0(1) 或 <=0(0)。
+    返回 [w1..w5, b] 或 None(样本不足/无区分度)。
+    """
+    if not rows or len(rows) < 60:
+        return None
+    labels = {y for _f, y in rows}
+    if len(labels) < 2:
+        return None                      # 全是同向样本, 训不出来
+    w = [0.0] * 5
+    b = 0.0
+    n = float(len(rows))
+    math_exp = __import__("math").exp
+    for _ in range(epochs):
+        gw = [0.0] * 5
+        gb = 0.0
+        for feats, y in rows:
+            z = sum(w[i] * feats[i] for i in range(5)) + b
+            p = 1.0 / (1.0 + math_exp(-max(-30.0, min(30.0, z))))
+            e = p - y
+            for i in range(5):
+                gw[i] += e * feats[i]
+            gb += e
+        w = [w[i] - lr * gw[i] / n for i in range(5)]
+        b -= lr * gb / n
+    return [round(v, 6) for v in w] + [round(b, 6)]
+
+
+def model_accuracy(rows, weights) -> float | None:
+    """模型在样本上的准确率(阈值 0.5); weights=None 时评估内置启发式。"""
+    if not rows:
+        return None
+    ok = 0
+    for feats, y in rows:
+        if weights and len(weights) >= 6:
+            z = sum(weights[i] * feats[i] for i in range(5)) + weights[5]
+            prob = 1.0 / (1.0 + __import__("math").exp(-max(-30.0, min(30.0, z))))
+            pred = 1 if prob >= 0.5 else 0
+        else:
+            pred = 1 if sum(feats) > 0 else 0     # 启发式: 各项得分和>0 看多
+        ok += (1 if pred == y else 0)
+    return ok / float(len(rows))
 
 
 # ---------------- 大模型研判 ----------------
@@ -967,18 +1022,18 @@ MCP_STOCK_URL = "http://82.156.17.205/cnstock/mcp"
 _mcp_cache: dict[str, tuple[float, str]] = {}      # code -> (时间, 文本)
 
 
-def mcp_stock_brief(code: str, timeout: float = 20.0, cache_sec: float = 1800.0):
-    """调用 mcp-cn-a-stock 的 brief 工具, 返回基本面+历史统计文本; 失败返回 None。
+def mcp_stock_brief(code: str, timeout: float = 20.0, cache_sec: float = 1800.0,
+                    level: str = "brief"):
+    """调用 mcp-cn-a-stock 工具, 返回该股数据文本; 失败返回 None。
 
-    数据源: 公开 MCP 服务(streamable-http JSON-RPC), 免费; 含 PE/PB/股息率/ROE
-    与 5/20/60/120/240 日均价、振幅、涨跌幅 —— 正是 AI 研判缺的历史维度。
+    level: brief=基本面+历史统计 | full=再加技术分析(信号摘要+最近3日指标明细)。
     带 30 分钟缓存, 避免重复请求触发限流。
     """
     sym = (code or "").upper()
     if not sym:
         return None
     now = __import__("time").time()
-    hit = _mcp_cache.get(sym)
+    hit = _mcp_cache.get((sym, level))
     if hit and now - hit[0] < cache_sec:
         return hit[1]
 
@@ -1005,15 +1060,33 @@ def mcp_stock_brief(code: str, timeout: float = 20.0, cache_sec: float = 1800.0)
         _rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
                             "clientInfo": {"name": "stockbar", "version": "1.0"}})
         _rpc("notifications/initialized", {}, rid=None)
-        data = _rpc("tools/call", {"name": "brief",
+        data = _rpc("tools/call", {"name": (level if level in ("brief", "medium", "full")
+                                            else "brief"),
                                    "arguments": {"symbol": sym}}, rid=2)
         text = ""
         for item in (data.get("result", {}).get("content") or []):
             if isinstance(item, dict) and item.get("type") == "text":
                 text += item.get("text", "")
         text = text.strip()
+        if level == "full" and text:
+            # 裁剪: 只留"信号摘要"+ 指标表头 + 最近 3 行(避免 prompt 过长)
+            keep = []
+            lines = text.splitlines()
+            table_seen = 0
+            for ln in lines:
+                if ln.startswith("|") and "---" not in ln:
+                    table_seen += 1
+                    if table_seen > 4:
+                        continue
+                elif ln.startswith("|") and "---" in ln:
+                    keep.append(ln)
+                    continue
+                if table_seen > 4 and ln.startswith("|"):
+                    continue
+                keep.append(ln)
+            text = "\n".join(keep)[:2200]
         if text:
-            _mcp_cache[sym] = (now, text)
+            _mcp_cache[(sym, level)] = (now, text)
         return text or None
     except Exception:
         return None
@@ -1027,7 +1100,7 @@ def llm_key(cfg=None) -> str:
     return k or os.environ.get("STOCKBAR_LLM_KEY", "").strip()
 
 
-def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 30.0):
+def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 60.0):
     """调 OpenAI 兼容接口 /chat/completions, 返回文本; 失败返回 None。
 
     配置: llm_enabled / llm_base / llm_model / llm_key(或环境变量)。
@@ -1052,7 +1125,7 @@ def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 30.0):
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
     body = json.dumps({"model": model, "messages": msgs,
-                       "temperature": 0.4, "max_tokens": 400}).encode("utf-8")
+                       "temperature": 0.4, "max_tokens": 1600}).encode("utf-8")
     try:
         req = urllib.request.Request(base, data=body, method="POST")
         req.add_header("Authorization", "Bearer " + key)
