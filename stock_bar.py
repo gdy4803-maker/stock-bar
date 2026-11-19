@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -1734,6 +1734,9 @@ class StockBar:
             {"type": "cmd", "label": "设置…", "shortcut": "Ctrl+Shift+S", "command": self.open_settings},
             {"type": "sep"},
             {"type": "cmd", "label": "管理自选股…", "shortcut": "Ctrl+M", "command": self.open_manage},
+            {"type": "cmd", "label": "自选强弱排序…", "command": self.open_strength},
+            {"type": "cmd", "label": "收盘选股…", "command": self.open_select},
+            {"type": "cmd", "label": "当日异动扫描…", "command": self.open_scan},
             {"type": "cmd", "label": "持仓设置…", "shortcut": "Ctrl+H", "command": self.open_holdings},
         ]
         stock_items = []
@@ -1847,6 +1850,15 @@ class StockBar:
 
     def open_manage(self):
         self._open_dialog("manage", lambda: sb_ui.ManageStocksWindow(self))
+
+    def open_strength(self):
+        self._open_dialog("strength", lambda: sb_ui.StrengthWindow(self))
+
+    def open_select(self):
+        self._open_dialog("select", lambda: sb_ui.SelectWindow(self))
+
+    def open_scan(self):
+        self._open_dialog("scan", lambda: sb_ui.ScanWindow(self))
 
     def open_holdings(self):
         self._open_dialog("holdings", lambda: sb_ui.HoldingsWindow(self))

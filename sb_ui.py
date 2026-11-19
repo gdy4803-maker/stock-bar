@@ -241,7 +241,7 @@ class InfoCard:
             ai_h = int(64 * S_) + ai_lines * int(13 * S_)
         else:
             ai_h = int(70 * S_) if ai_on else 0
-        h = int(96 * S_) + int(22 * S_) + row_h * max(5, len(rows)) + int(64 * S_) + ai_h
+        h = int(96 * S_) + int(42 * S_) + row_h * max(5, len(rows)) + int(64 * S_) + ai_h
         self.w, self.h = w, h
         c = self.canvas
         c.configure(width=w, height=h)
@@ -302,6 +302,20 @@ class InfoCard:
                           text="AI 研判: 未运行 —— 悬浮行情条按 T 开始",
                           anchor="w", fill=pal["faint"], font=fonts.tiny())
         y += int(22 * S_)
+
+        # 相对强度(RPS 近似) + 形态提示(来自 MCP)
+        st = D.mcp_strength(code) if code else None
+        if st and (st.get("alpha") or st.get("flags")):
+            a60 = st["alpha"].get("60")
+            txt2 = "强度 "
+            if a60 is not None:
+                txt2 += ("60日跑赢基准 %+.1f%%" % a60)
+            if st.get("flags"):
+                txt2 += " ｜ " + "、".join(st["flags"][:2])
+            tone2 = (pal["pos"] if (a60 or 0) >= 0 else pal["neg"])
+            c.create_text(pad, y, text=txt2, anchor="w", fill=tone2,
+                          font=fonts.tiny())
+            y += int(20 * S_)
 
         # 五项明细
         c.create_line(pad, y, w - pad, y, fill=pal["border_soft"])
@@ -411,6 +425,9 @@ class InfoCard:
         brief = D.mcp_stock_brief(code, level="full")
         if brief:
             extra.append("- 该股基本面/历史统计/技术分析(数据源 mcp-cn-a-stock):\n" + brief)
+        st = D.mcp_strength(code)
+        if st and st.get("flags"):
+            extra.append("- 相对强度/形态提示: " + "、".join(st["flags"]))
         prompt = (
             "你是A股盘前研判助手。以下是【真实行情数据】, 请只依据这些数据研判:\n"
             f"1) 股票: {q.name}({code})\n"
@@ -1946,6 +1963,316 @@ class SupportDialog(BaseDialog):
 
 
 # ---------------- 自选股管理 ----------------
+def _section_card(parent, title, pal, fonts, scale):
+    """通用卡片容器(标题 + 内容区), 供各窗口复用; 自动铺满 parent。"""
+    box = tk.Frame(parent, bg=pal["panel"])
+    box.pack(fill="both", expand=True)          # 关键: 容器自身要铺开, 否则内容不显示
+    inner = tk.Frame(box, bg=pal["panel_alt"], highlightbackground=pal["border_soft"],
+                     highlightthickness=1)
+    inner.pack(fill="both", expand=True)
+    tk.Label(inner, text=title, anchor="w", bg=pal["panel_alt"], fg=pal["text_dim"],
+             font=fonts.label()).pack(anchor="w", padx=12, pady=(8, 2))
+    return inner
+
+
+class SelectWindow(BaseDialog):
+    """收盘选股: 策略可勾选(海龟/RPS/放量/旗形等), 双击加自选。"""
+    key = "select"
+
+    def __init__(self, app):
+        super().__init__(app, "收盘选股", 900, 720)
+        setup_ttk(self.win, self.pal, self.fonts, self.S)     # 表格样式跟随主题
+        self.header("收盘选股", "全市场初筛 + 策略命中, 收盘后跑效果最好; 双击一行加入自选")
+        pal = self.pal
+        # 先占住底部按钮栏, 再让内容区填充(否则按钮会被挤出可视区)
+        foot = tk.Frame(self.body, bg=pal["panel"])
+        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
+        CanvasButton(foot, "关闭", self.close, pal, self.fonts, kind="primary",
+                     width=84, height=32, scale=self.S).pack(side="right")
+        body = tk.Frame(self.body, bg=pal["panel"])
+        body.pack(fill="both", expand=True, pady=(6, 0))
+        card = _section_card(body, "策略与筛选", pal, self.fonts, self.S)
+        row = tk.Frame(card, bg=pal["panel_alt"])
+        row.pack(fill="x", padx=12, pady=(2, 0))
+        self._checks = {}
+        saved = set(self.app.cfg.get("select_strategies") or D.STRATEGIES)
+        for name in D.STRATEGIES:
+            var = tk.BooleanVar(value=(name in saved))
+            self._checks[name] = var
+            tk.Checkbutton(row, text=name, variable=var, bg=pal["panel_alt"],
+                           fg=pal["text_dim"], selectcolor=pal["panel"],
+                           activebackground=pal["panel_alt"],
+                           activeforeground=pal["text"],
+                           font=self.fonts.tiny()).pack(side="left", padx=(0, 8))
+        row2 = tk.Frame(card, bg=pal["panel_alt"])
+        row2.pack(fill="x", padx=12, pady=(4, 8))
+        tk.Label(row2, text="筛选深度", bg=pal["panel_alt"], fg=pal["muted"],
+                 font=self.fonts.tiny()).pack(side="left")
+        self.depth_var = tk.StringVar(value=str(self.app.cfg.get("select_depth") or 60))
+        ent = make_entry(row2, pal, self.fonts, width=6, textvariable=self.depth_var,
+                         numeric=True)
+        ent.pack(side="left", ipady=3, padx=(6, 6))
+        tk.Label(row2, text="(深入分析的候选数 5~500; 初筛已覆盖全市场, 深度越大越慢)",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left")
+        CanvasButton(row2, "开始选股", self._start, pal, self.fonts, kind="primary",
+                     width=104, height=32, scale=self.S).pack(side="left")
+        self.status = tk.Label(row2, text="勾选策略后点「开始选股」", bg=pal["panel_alt"],
+                               fg=pal["faint"], font=self.fonts.tiny())
+        self.status.pack(side="left", padx=(12, 0))
+        cols = [("idx", "#", 34, "c"), ("name", "名称", 118, "w"),
+                ("code", "代码", 80, "w"), ("price", "现价", 76, "e"),
+                ("pct", "涨幅", 70, "e"), ("amount", "成交额", 84, "e"),
+                ("hits", "命中数", 62, "c"), ("reasons", "命中策略(依据)", 240, "w")]
+        self.tree = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
+                                 style="SB.Treeview", height=14)
+        for cid, label, width, anchor in cols:
+            self.tree.heading(cid, text=label, anchor=anchor)
+            self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
+        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tree.bind("<Double-Button-1>", self._add)
+        tk.Label(card, text="命中策略越多越可靠; 数据每 30 分钟缓存",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(0, 8))
+        self._busy = False
+
+    def _start(self):
+        if getattr(self, "_busy", False):
+            return
+        use = [n for n, v in self._checks.items() if v.get()]
+        if not use:
+            self.status.config(text="请至少勾选一个策略")
+            return
+        try:
+            depth = max(5, min(500, int(self.depth_var.get() or 60)))
+        except ValueError:
+            depth = 60
+        self.app.cfg["select_strategies"] = use
+        self.app.cfg["select_depth"] = depth
+        self.app.save_config()
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        self._busy = True
+        self.status.config(text="选股中… 0/%d" % depth)
+
+        def prog(i, n, name):
+            self._prog_text = "选股中… %d/%d %s" % (i, n, name)
+
+        def work():
+            err = None
+            rows = []
+            try:
+                rows = D.select_stocks(check=depth, strategies=use, on_progress=prog)
+            except Exception as exc:
+                err = str(exc)[:80]
+            self._result = (rows, err)      # 主线程轮询取走(线程里不能调 Tk)
+
+        self._prog_text = "选股中… 0/%d" % depth
+        self._result = None
+        threading.Thread(target=work, daemon=True).start()
+        self._poll_result()
+
+    def _poll_result(self):
+        """主线程轮询后台结果(Tk 的 after 不能在子线程调用)。"""
+        if self._result is not None:
+            rows, err = self._result
+            self._result = None
+            self._done(rows, err)
+            return
+        if getattr(self, "_prog_text", None):
+            self.status.config(text=self._prog_text)
+        try:
+            self.win.after(150, self._poll_result)
+        except Exception:
+            self._busy = False
+
+    def _done(self, rows, err):
+        self._busy = False
+        if err:
+            self.status.config(text="选股失败: %s" % err)
+            return
+        if not rows:
+            self.status.config(text="无命中(可加大筛选深度或勾选更多策略)")
+            return
+        for i, r in enumerate(rows, 1):
+            self.tree.insert("", "end", iid=r["code"], values=(
+                i, r["name"], D.code_digits(r["code"]),
+                D.fmt_price(r["price"], 2), D.fmt_pct(r["pct"]),
+                D.fmt_yi_wan(r["amount"]), len(r.get("hits") or {}),
+                r.get("reasons", "")))
+        self.status.config(text="共 %d 只命中(按命中策略数排序)" % len(rows))
+
+    def _add(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        code = sel[0]
+        vals = self.tree.item(sel[0], "values")
+        app = self.app
+        picks = [D.normalize_code(c) for c in (app.cfg.get("stocks") or []) if c]
+        if code in picks:
+            self.status.config(text="%s 已在自选中" % vals[1])
+            return
+        picks.append(code)
+        app.cfg["stocks"] = picks
+        app.save_config()
+        try:
+            app._load_lists()
+            app._restart_worker()
+        except Exception:
+            pass
+        self.status.config(text="已加入自选: %s" % vals[1])
+
+
+class StrengthWindow(BaseDialog):
+    """自选强弱排序: 按 RPS 近似(60日跑赢基准) + 竞价评分排序。"""
+    key = "strength"
+
+    def __init__(self, app):
+        super().__init__(app, "自选强弱排序", 780, 620)
+        setup_ttk(self.win, self.pal, self.fonts, self.S)     # 表格样式跟随主题
+        self.header("自选强弱排序", "按 60 日相对强度(RPS 近似)与竞价评分排序, 数据免费即时")
+        pal = self.pal
+        foot = tk.Frame(self.body, bg=pal["panel"])
+        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
+        self.status = tk.Label(foot, text="加载中…", bg=pal["panel"], fg=pal["faint"],
+                               font=self.fonts.tiny())
+        self.status.pack(side="left")
+        CanvasButton(foot, "刷新", self._load, pal, self.fonts, kind="ghost",
+                     width=84, height=32, scale=self.S).pack(side="right")
+        CanvasButton(foot, "关闭", self.close, pal, self.fonts, kind="primary",
+                     width=84, height=32, scale=self.S).pack(side="right", padx=(0, 8))
+        body = tk.Frame(self.body, bg=pal["panel"])
+        body.pack(fill="both", expand=True, pady=(6, 0))
+        card = _section_card(body, "强弱排序", pal, self.fonts, self.S)
+        cols = [("idx", "#", 34, "c"), ("name", "名称", 120, "w"),
+                ("code", "代码", 84, "w"), ("alpha", "60日跑赢基准", 110, "e"),
+                ("a20", "20日跑赢", 96, "e"), ("score", "竞价评分", 84, "e"),
+                ("flags", "形态/强度", 180, "w")]
+        self.tree = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
+                                 style="SB.Treeview", height=14)
+        for cid, label, width, anchor in cols:
+            self.tree.heading(cid, text=label, anchor=anchor)
+            self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
+        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(card, text="RPS 近似 = 该股涨幅 - 沪深300 同期涨幅; 数据每 30 分钟缓存",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(0, 8))
+        self.win.after(60, self._load)
+
+    def _load(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        app = self.app
+        try:
+            rows = []
+            for code in app.pick_codes:
+                if not code:
+                    continue
+                q = app.quotes.get(code)
+                st = D.mcp_strength(code) or {}
+                a60 = (st.get("alpha") or {}).get("60")
+                a20 = (st.get("alpha") or {}).get("20")
+                samples = (getattr(app, "_auction", {}) or {}).get(code, [])
+                sc = D.auction_score(samples, q.prev_close if q else
+                                     (getattr(app, "_auction_prev", {}) or {}).get(code, 0),
+                                     getattr(app, "_score_weights", None)) if samples else None
+                rows.append((code, q.name if q else code, a60, a20,
+                             sc["total"] if sc else None,
+                             "、".join((st.get("flags") or [])[:2])))
+        except Exception as exc:
+            self.status.config(text="加载失败: %s" % str(exc)[:80])
+            return
+        if not rows:
+            self.status.config(text="无自选或数据未就绪(需联网; 数据 30 分钟缓存)")
+            return
+        rows.sort(key=lambda r: (-(r[2] if r[2] is not None else -999),
+                                 -(r[4] if r[4] is not None else -999)))
+        for i, (code, name, a60, a20, score, flags) in enumerate(rows, 1):
+            self.tree.insert("", "end", values=(
+                i, name, D.code_digits(code),
+                ("%.1f%%" % a60) if a60 is not None else "-",
+                ("%.1f%%" % a20) if a20 is not None else "-",
+                ("%+d" % score) if score is not None else "-", flags))
+        self.status.config(text="共 %d 只(按 60 日相对强度排序)" % len(rows))
+
+
+class ScanWindow(BaseDialog):
+    """当日异动扫描: 全市场放量大涨股(1 个请求)。"""
+    key = "scan"
+
+    def __init__(self, app):
+        super().__init__(app, "当日异动扫描", 780, 640)
+        setup_ttk(self.win, self.pal, self.fonts, self.S)     # 表格样式跟随主题
+        self.header("当日异动扫描", "全市场筛选: 涨幅 ≥4% 且成交额 ≥2亿, 按涨幅降序")
+        pal = self.pal
+        foot = tk.Frame(self.body, bg=pal["panel"])
+        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
+        self.status = tk.Label(foot, text="加载中…", bg=pal["panel"], fg=pal["faint"],
+                               font=self.fonts.tiny())
+        self.status.pack(side="left")
+        CanvasButton(foot, "刷新", self._load, pal, self.fonts, kind="ghost",
+                     width=84, height=32, scale=self.S).pack(side="right")
+        CanvasButton(foot, "关闭", self.close, pal, self.fonts, kind="primary",
+                     width=84, height=32, scale=self.S).pack(side="right", padx=(0, 8))
+        body = tk.Frame(self.body, bg=pal["panel"])
+        body.pack(fill="both", expand=True, pady=(6, 0))
+        card = _section_card(body, "异动列表", pal, self.fonts, self.S)
+        cols = [("idx", "#", 34, "c"), ("name", "名称", 120, "w"),
+                ("code", "代码", 84, "w"), ("price", "现价", 78, "e"),
+                ("pct", "涨幅", 72, "e"), ("amount", "成交额", 88, "e")]
+        self.tree = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
+                                 style="SB.Treeview", height=16)
+        for cid, label, width, anchor in cols:
+            self.tree.heading(cid, text=label, anchor=anchor)
+            self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
+        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tree.bind("<Double-Button-1>", self._add)
+        tk.Label(card, text="双击一行 = 加入自选; 数据来自全市场实时快照",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(0, 8))
+        self.win.after(60, self._load)
+
+    def _load(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        try:
+            rows = D.scan_market(limit=40)
+        except Exception as exc:
+            self.status.config(text="加载失败: %s" % str(exc)[:80])
+            return
+        if not rows:
+            self.status.config(text="无异动股(或接口暂不可用, 请稍后刷新)")
+            return
+        for i, r in enumerate(rows, 1):
+            self.tree.insert("", "end", iid=r["code"], values=(
+                i, r["name"], D.code_digits(r["code"]),
+                D.fmt_price(r["price"], 2), D.fmt_pct(r["pct"]),
+                D.fmt_yi_wan(r["amount"])))
+        self.status.config(text="共 %d 只异动(涨幅≥4%% 且成交额≥2亿)" % len(rows))
+
+    def _add(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        code = sel[0]                      # 行的 iid 就是完整代码(sh600519)
+        vals = self.tree.item(sel[0], "values")
+        app = self.app
+        picks = [D.normalize_code(c) for c in (app.cfg.get("stocks") or []) if c]
+        if code in picks:
+            self.status.config(text="%s 已在自选中" % vals[1])
+            return
+        picks.append(code)
+        app.cfg["stocks"] = picks
+        app.save_config()
+        try:
+            app._load_lists()
+            app._restart_worker()          # 让新自选立即开始抓行情
+        except Exception:
+            pass
+        self.status.config(text="已加入自选: %s" % vals[1])
+
+
 class ManageStocksWindow(BaseDialog):
     key = "manage"
 

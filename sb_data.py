@@ -1092,6 +1092,213 @@ def mcp_stock_brief(code: str, timeout: float = 20.0, cache_sec: float = 1800.0,
         return None
 
 
+def mcp_strength(code: str):
+    """从 MCP 数据提取相对强度(RPS 近似)与形态提示(给评分卡/AI 用)。
+
+    返回 {"alpha": {"5"/"20"/"60": x}, "high20":.., "price":.., "flags":[...]} 或 None。
+    """
+    t = mcp_stock_brief(code)
+    if not t:
+        return None
+    out = {"alpha": {}, "high20": None, "low20": None, "price": None, "flags": []}
+    for ln in t.splitlines():
+        s = ln.strip()
+        if "跑赢" in s or "Alpha" in s:
+            nums = []
+            for c in s.split("|"):
+                c = c.strip().replace("%", "").replace("+", "")
+                try:
+                    nums.append(float(c))
+                except (TypeError, ValueError):
+                    continue
+            for key, i in (("1", 0), ("5", 1), ("20", 2), ("60", 3)):
+                if len(nums) > i:
+                    out["alpha"][key] = nums[i]
+        if "20日" in s and "最高" in s:
+            try:
+                out["high20"] = float(s.split("最高:")[1].split()[0])
+            except Exception:
+                pass
+            try:
+                out["low20"] = float(s.split("最低:")[1].split()[0])
+            except Exception:
+                pass
+        if s.startswith("- 今日:") or s.startswith("- 当日:"):
+            try:
+                out["price"] = float(s.split(":")[1].split()[0])
+            except Exception:
+                pass
+    a60 = out["alpha"].get("60")
+    a20 = out["alpha"].get("20")
+    if a60 is not None:
+        if a60 >= 15:
+            out["flags"].append("RPS强势(60日跑赢基准 %+.1f%%)" % a60)
+        elif a60 <= -10:
+            out["flags"].append("RPS弱势(60日跑输基准 %+.1f%%)" % a60)
+    if out["price"] and out["high20"] and out["price"] >= out["high20"] * 0.995:
+        out["flags"].append("接近/突破20日新高")
+    if a20 is not None and a20 >= 10:
+        out["flags"].append("中期上升趋势(20日跑赢 %+.1f%%)" % a20)
+    return out
+
+
+def scan_market(limit: int = 40, timeout: float = 15.0):
+    """当日异动扫描: 全市场 A 股快照(1 个请求) -> 筛放量大涨/成交额大的。
+
+    返回 [{"code","name","price","pct","amount"(元),"volume"(手)}, ...] 按涨幅降序。
+    规则: 涨幅>=4% 且 成交额>=2亿, 取前 limit 只。
+    """
+    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=600&po=1&np=1"
+           "&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fid=f3"
+           "&fields=f2,f3,f5,f6,f12,f13,f14")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": HEADERS["User-Agent"], "Referer": "https://quote.eastmoney.com/"})
+    raw = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+            break
+        except Exception:
+            import time as _t
+            _t.sleep(0.8 * (attempt + 1))
+    if raw is None:
+        return []
+    try:
+        rows = ((json.loads(raw.decode("utf-8", "replace")).get("data") or {}).get("diff")) or []
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            pct = float(r.get("f3") or 0)
+            amount = float(r.get("f6") or 0)          # 元
+            price = float(r.get("f2") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or pct < 4.0 or amount < 2e8:
+            continue
+        num = str(r.get("f12") or "")
+        mkt = str(r.get("f13") or "0")
+        code = ("sh" if mkt == "1" else "sz") + num
+        out.append({"code": code, "name": str(r.get("f14") or num),
+                    "price": price, "pct": pct, "amount": amount,
+                    "volume": float(r.get("f5") or 0)})
+    out.sort(key=lambda x: x["pct"], reverse=True)
+    return out[:limit]
+
+
+STRATEGIES = ("海龟突破", "RPS突破", "放量突破", "高窄旗形", "涨停洗盘", "跌停反包", "强势回调")
+
+
+def _strategy_hits(r, st):
+    """单只股票命中哪些策略 -> {策略名: 依据}; 未命中的不出现。"""
+    a = st.get("alpha") or {}
+    a20, a60 = a.get("20"), a.get("60")
+    p, h20, l20 = st.get("price"), st.get("high20"), st.get("low20")
+    hits = {}
+    # 海龟突破: 20日新高 + 成交额过亿 + 阳线(防诱多)
+    if p and h20 and p >= h20 * 0.998 and r["amount"] >= 1e8 and r["pct"] > 0:
+        hits["海龟突破"] = "20日新高+成交额%.1f亿" % (r["amount"] / 1e8)
+    # RPS 突破: 60日跑赢基准>=20% + 20日趋势向上
+    if a60 is not None and a60 >= 20 and (a20 or 0) > 0:
+        hits["RPS突破"] = "60日跑赢%+.0f%%/20日%+.0f%%" % (a60, a20 or 0)
+    # 放量突破: 涨幅>=4% + 成交额>=2亿 + 逼近/突破20日高点
+    if r["pct"] >= 4 and r["amount"] >= 2e8 and p and h20 and p >= h20 * 0.97:
+        hits["放量突破"] = "涨幅%+.1f%%+成交额%.1f亿" % (r["pct"], r["amount"] / 1e8)
+    # 高窄旗形: 20日振幅<25% + 逼近高点 + 60日强势
+    if p and h20 and l20 and h20 > l20 and (h20 - l20) / max(p, 0.01) < 0.25 \
+            and p >= h20 * 0.97 and (a60 or 0) >= 15:
+        hits["高窄旗形"] = "振幅%.0f%%+逼近高点" % ((h20 - l20) / p * 100)
+    # 涨停洗盘(近似): 短期横盘整理 + 60日强势 + 逼近高点
+    if -2.0 <= r["pct"] <= 2.0 and p and h20 and p >= h20 * 0.93 and (a60 or 0) >= 15:
+        hits["涨停洗盘"] = "整理中+60日跑赢%+.0f%%" % (a60 or 0)
+    # 跌停反包(近似): 大涨收复 + 中期趋势向上
+    if r["pct"] >= 5 and (a20 or 0) > 0 and (a60 or 0) >= 10:
+        hits["跌停反包"] = "强反弹%+.1f%%" % r["pct"]
+    # 强势回调: 60日强 + 20日回调
+    if (a60 or 0) >= 15 and (a20 or 0) < -2:
+        hits["强势回调"] = "60日%+.0f%%/20日%+.0f%%" % (a60 or 0, a20 or 0)
+    return hits
+
+
+def select_stocks(check: int = 60, strategies=None, on_progress=None):
+    """收盘后选股: 全市场快照初筛 -> 逐只取历史(MCP) -> 策略命中打分 -> 排序。
+
+    strategies: 使用哪些策略(默认全部); 结果含 hits(命中策略及依据)。
+    """
+    use = set(strategies) if strategies else set(STRATEGIES)
+    snap = market_snapshot(min_pct=1.5, min_amount=3e8, limit=max(check * 3, 200))
+    if not snap:
+        return []
+    out = []
+    for i, r in enumerate(snap[:check]):
+        if on_progress:
+            try:
+                on_progress(i + 1, min(check, len(snap)), r["name"])
+            except Exception:
+                pass
+        st = mcp_strength(r["code"]) or {}
+        all_hits = _strategy_hits(r, st)
+        hits = {k: v for k, v in all_hits.items() if k in use}
+        score = len(hits) * 2           # 命中越多越可靠
+        r = dict(r)
+        r["score"] = score
+        r["hits"] = hits
+        r["reasons"] = "、".join("%s(%s)" % (k, v) for k, v in hits.items()) or "无命中"
+        out.append(r)
+    out = [r for r in out if r["score"] > 0]
+    out.sort(key=lambda x: (-x["score"], -x["pct"]))
+    return out[:20]
+
+
+def market_snapshot(min_pct: float = 4.0, min_amount: float = 2e8,
+                    limit: int = 400, timeout: float = 15.0):
+    """全市场 A 股快照(1 个请求): 按涨幅降序返回符合条件的股票。"""
+    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=600&po=1&np=1"
+           "&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fid=f3"
+           "&fields=f2,f3,f5,f6,f12,f13,f14")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": HEADERS["User-Agent"], "Referer": "https://quote.eastmoney.com/"})
+    raw = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+            break
+        except Exception:
+            import time as _t
+            _t.sleep(0.8 * (attempt + 1))
+    if raw is None:
+        return []
+    try:
+        rows = ((json.loads(raw.decode("utf-8", "replace")).get("data") or {}).get("diff")) or []
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            pct = float(r.get("f3") or 0)
+            amount = float(r.get("f6") or 0)
+            price = float(r.get("f2") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or pct < min_pct or amount < min_amount:
+            continue
+        num = str(r.get("f12") or "")
+        mkt = str(r.get("f13") or "0")
+        code = ("sh" if mkt == "1" else "sz") + num
+        out.append({"code": code, "name": str(r.get("f14") or num),
+                    "price": price, "pct": pct, "amount": amount,
+                    "volume": float(r.get("f5") or 0)})
+    out.sort(key=lambda x: x["pct"], reverse=True)
+    return out[:limit]
+
+
 def llm_key(cfg=None) -> str:
     """API Key: 优先 config.json 的 llm_key, 没有则读环境变量 STOCKBAR_LLM_KEY。"""
     k = ""
