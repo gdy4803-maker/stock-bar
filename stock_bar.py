@@ -616,6 +616,12 @@ class StockBar:
         self.root = tk.Tk()
         self.root.report_callback_exception = self._tk_callback_error
         self.root.title(APP_NAME)
+        try:
+            import sb_logo
+            self._logo_photo = sb_logo.photo()
+            self.root.iconphoto(True, self._logo_photo)   # 窗口左上角 Logo
+        except Exception:
+            self._logo_photo = None
         self.root.overrideredirect(True)
         # 文字层: 色键 = 胶囊底色, ClearType 会混到底色上, 文字锐利无彩边
         self.root.configure(bg=self.pal["bar_bg"])
@@ -1010,6 +1016,7 @@ class StockBar:
         w, h = max(1, int(w)), max(1, int(h))
         if (w, h) == (self._w, self._h):
             return False
+        first = self._first_place
         if self._first_place:
             pos = self.cfg.get("window_pos")
             if isinstance(pos, dict):
@@ -1022,9 +1029,18 @@ class StockBar:
         else:
             x, y = self._x, self._y
         if self.cfg.get("dock_taskbar"):
-            # 嵌入任务栏: 只在"开启嵌入"时找一次空位; 之后尺寸变化只跟随、不搬家
-            # (每次重扫会被弹出窗口当成障碍物, 还会把用户拖好的位置冲掉)
-            x, y = self._dock_pos(w, h, rescan=False)
+            # 嵌入任务栏:
+            #  首次启动 -> 优先用记忆的位置(dock_pos), 没有记忆才扫空位做障碍物判断;
+            #  之后尺寸变化 -> 只跟随、不搬家(避免弹窗被当障碍物/冲掉拖好的位置)
+            if first:
+                dp = self.cfg.get("dock_pos")
+                if isinstance(dp, dict):
+                    x, y = self._dock_pos(w, h, rescan=False,
+                                          x_hint=int(dp["x"]))   # 恢复记忆的位置
+                else:
+                    x, y = self._dock_pos(w, h, rescan=True)    # 无记忆: 扫一次空位
+            else:
+                x, y = self._dock_pos(w, h, rescan=False)
         x, y = self.screen.clamp(x, y, w, h)
         self._x, self._y = x, y
         self._w, self._h = w, h
@@ -1091,6 +1107,8 @@ class StockBar:
         self._render_bar(force=was_pressed)
         if abs(dx) + abs(dy) >= 4:
             self.cfg["window_pos"] = {"x": self._x, "y": self._y}
+            if self.cfg.get("dock_taskbar"):
+                self.cfg["dock_pos"] = {"x": self._x, "y": self._y}   # 记忆嵌入位置
             self.save_config()
             self._restack_bar()
         elif True:
@@ -1902,10 +1920,10 @@ class StockBar:
 
     # ---------- 任务栏嵌入 ----------
     def _dock_pos(self, w: int | None = None, h: int | None = None,
-                  rescan: bool = True) -> tuple[int, int]:
+                  rescan: bool = True, x_hint: int | None = None) -> tuple[int, int]:
         """嵌入任务栏(左)时的目标坐标: 垂直居中; rescan=True 才找任务栏空位。
 
-        rescan=False 保持当前 x(用户拖好的位置/尺寸变化时只跟随不搬家)。
+        rescan=False 保持当前 x(x_hint 优先), 用于"跟随尺寸不搬家"和"恢复记忆位置"。
         """
         w = self._w if w is None else w
         h = self._h if h is None else h
@@ -1917,7 +1935,7 @@ class StockBar:
                                             ignore=(self._x, self._x + self._w))
             x = gap if gap is not None else bx + int(12 * self.scale)
         else:
-            x = self._x
+            x = x_hint if x_hint is not None else self._x
         y = by + max(0, (bh - h) // 2)
         return self.screen.clamp(x, y, w, h)
 
@@ -1931,6 +1949,7 @@ class StockBar:
             self._dock_band = self.screen.taskbar_band(self._x + self._w // 2,
                                                        self._y + self._h // 2)
             self.cfg["window_pos"] = {"x": self._x, "y": self._y}
+            self.cfg["dock_pos"] = {"x": self._x, "y": self._y}     # 记忆嵌入位置
         self.save_config()
         self._restack_bar()
 

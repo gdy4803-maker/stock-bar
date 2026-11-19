@@ -1143,51 +1143,13 @@ def mcp_strength(code: str):
 
 
 def scan_market(limit: int = 40, timeout: float = 15.0):
-    """当日异动扫描: 全市场 A 股快照(1 个请求) -> 筛放量大涨/成交额大的。
+    """当日异动扫描: 全市场 A 股快照(新浪主源/东财兜底) -> 筛放量大涨。
 
     返回 [{"code","name","price","pct","amount"(元),"volume"(手)}, ...] 按涨幅降序。
     规则: 涨幅>=4% 且 成交额>=2亿, 取前 limit 只。
     """
-    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=600&po=1&np=1"
-           "&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fid=f3"
-           "&fields=f2,f3,f5,f6,f12,f13,f14")
-    req = urllib.request.Request(url, headers={
-        "User-Agent": HEADERS["User-Agent"], "Referer": "https://quote.eastmoney.com/"})
-    raw = None
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-            break
-        except Exception:
-            import time as _t
-            _t.sleep(0.8 * (attempt + 1))
-    if raw is None:
-        return []
-    try:
-        rows = ((json.loads(raw.decode("utf-8", "replace")).get("data") or {}).get("diff")) or []
-    except Exception:
-        return []
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        try:
-            pct = float(r.get("f3") or 0)
-            amount = float(r.get("f6") or 0)          # 元
-            price = float(r.get("f2") or 0)
-        except (TypeError, ValueError):
-            continue
-        if price <= 0 or pct < 4.0 or amount < 2e8:
-            continue
-        num = str(r.get("f12") or "")
-        mkt = str(r.get("f13") or "0")
-        code = ("sh" if mkt == "1" else "sz") + num
-        out.append({"code": code, "name": str(r.get("f14") or num),
-                    "price": price, "pct": pct, "amount": amount,
-                    "volume": float(r.get("f5") or 0)})
-    out.sort(key=lambda x: x["pct"], reverse=True)
-    return out[:limit]
+    out = market_snapshot(min_pct=4.0, min_amount=2e8, limit=limit, timeout=timeout)
+    return out
 
 
 STRATEGIES = ("海龟突破", "RPS突破", "放量突破", "高窄旗形", "涨停洗盘", "跌停反包", "强势回调")
@@ -1256,7 +1218,51 @@ def select_stocks(check: int = 60, strategies=None, on_progress=None):
 
 def market_snapshot(min_pct: float = 4.0, min_amount: float = 2e8,
                     limit: int = 400, timeout: float = 15.0):
-    """全市场 A 股快照(1 个请求): 按涨幅降序返回符合条件的股票。"""
+    """全市场 A 股快照(按涨幅降序): 主用新浪排行接口, 失败退回东财。
+
+    新浪: Market_Center.getHQNodeData(node=hs_a, sort=changepercent) 80条/页。
+    """
+    out = []
+    # ---- 主源: 新浪全市场排行 ----
+    try:
+        for page in (1, 2, 3):
+            url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                   "Market_Center.getHQNodeData?page=%d&num=80&sort=changepercent&asc=0"
+                   "&node=hs_a&symbol=&_s_r_a=page" % page)
+            req = urllib.request.Request(url, headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Referer": "https://finance.sina.com.cn/"})
+            raw = urllib.request.urlopen(req, timeout=timeout).read()
+            rows = json.loads(raw.decode("utf-8", "replace"))
+            if not rows:
+                break
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    pct = float(r.get("changepercent") or 0)
+                    amount = float(r.get("amount") or 0)      # 元
+                    price = float(r.get("trade") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0 or pct < min_pct or amount < min_amount:
+                    continue
+                out.append({"code": str(r.get("symbol") or ""),
+                            "name": str(r.get("name") or ""),
+                            "price": price, "pct": pct, "amount": amount,
+                            "volume": float(r.get("volume") or 0) / 100.0})
+            if len(out) >= limit:
+                break
+    except Exception:
+        out = []
+    if out:
+        out.sort(key=lambda x: x["pct"], reverse=True)
+        return out[:limit]
+    # ---- 兜底: 东财 ----
+    return _snapshot_eastmoney(min_pct, min_amount, limit, timeout)
+
+
+def _snapshot_eastmoney(min_pct, min_amount, limit, timeout):
     url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=600&po=1&np=1"
            "&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fid=f3"
            "&fields=f2,f3,f5,f6,f12,f13,f14")
