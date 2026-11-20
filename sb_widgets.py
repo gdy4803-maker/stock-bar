@@ -260,7 +260,8 @@ class Slider(tk.Canvas):
         self.bind("<Button-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", lambda e: self._commit())
-        self._label_w = self.font.measure("100%") + 10 * scale
+        # 右侧数值区: 留出滑块半径 + 与文字之间的空隙, 避免 "100%" 贴住滑块
+        self._label_w = self.font.measure("100%") + 20 * scale
         self._draw()
 
     def _track_box(self):

@@ -6,7 +6,7 @@
   - 中间: 持仓当日盈亏(有持仓时显示)
   - 右边: 指数涨跌幅
   - 悬停: 弹出详情卡(名称/现价/涨跌/分时图/OHLC/量额/持仓盈亏)
-  - 右键: 深色菜单(设置/自选/持仓/切换/刷新间隔/置顶/退出)
+  - 右键: 深色菜单(设置/自选/持仓/切换/置顶/帮助/退出)
 
 技术要点:
   - 双窗口: 视觉窗口(色键透明, 只画文字/胶囊) + 交互窗口(几乎全透明, 整块命中),
@@ -49,7 +49,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -693,6 +693,7 @@ class StockBar:
         self.input.bind("<Control-h>", lambda e: self.open_holdings())
         self.input.bind("<Control-c>", lambda e: self.copy_quotes())
         self.input.bind("<F5>", lambda e: self.reload_config())
+        self.input.bind("<F1>", lambda e: self.open_help())
 
         self._load_lists()
         self._load_auction_cache()     # 载入今日竞价存档(重启后评分卡立即可用)
@@ -810,7 +811,7 @@ class StockBar:
         if mode == "compact":
             add(pick_text, F.num(), pick_color, 0, "pick")
             if pnl is not None:
-                add("", F.label(), pal["border"], 9, "sep")
+                add("", F.label(), pal["border"], 9, "seppnl")
                 add(pnl_text, F.num(), pnl_color, 9, "pnl")
             if self.index_code:
                 add("", F.label(), pal["border"], 9, "sep")
@@ -825,7 +826,7 @@ class StockBar:
         else:
             add(pick_text, F.num(), pick_color, 0, "pick")
         if pnl is not None:
-            add("", F.label(), pal["border"], 9, "sep")
+            add("", F.label(), pal["border"], 9, "seppnl")
             add("持仓", F.label(), pal["muted"], 9, "pnlname")
             add(pnl_text, F.num(), pnl_color, 4, "pnl")
         if self.index_code:
@@ -939,7 +940,7 @@ class StockBar:
         radius = h / 2
         width = pad * 2
         for p in parts:
-            width += p["gap"] + (1 if p["kind"] == "sep" else p["font"].measure(p["text"]))
+            width += p["gap"] + (1 if p["kind"] in ("sep", "seppnl") else p["font"].measure(p["text"]))
         width = max(int(round(width)), int(40 * self.scale))
         sig = (self.cfg["appearance"], self.cfg["show_name"], self.cfg["theme"],
                self.cfg["font_size"], round(self.cfg["opacity"], 2),
@@ -996,9 +997,9 @@ class StockBar:
         for p in parts:
             x += p["gap"]
             color = p["color"]
-            if p["kind"] == "sep":
-                if self._zone_pnl_left is None:
-                    self._zone_pnl_left = x     # 第一条分隔线 = 持仓段左界
+            if p["kind"] in ("sep", "seppnl"):
+                if p["kind"] == "seppnl" and self._zone_pnl_left is None:
+                    self._zone_pnl_left = x     # 持仓分隔线 = 持仓段左界(无持仓时不存在)
                 c.create_line(x, h * 0.3, x, h * 0.7, fill=color)
                 x += 1
             else:
@@ -1311,11 +1312,13 @@ class StockBar:
     def _worker_loop(self, gen: int, codes: list[str], index_code: str,
                      interval: float, stop: threading.Event):
         failures = 0
+        first = True                # 启动时无条件拉一次(不受请求时段限制), 先有数据
         while not stop.is_set():
             started = time.time()
-            if not self._fetch_allowed():
+            if not first and not self._fetch_allowed():
                 stop.wait(20.0)            # 非请求时段: 只等待, 不打接口
                 continue
+            first = False
             try:
                 quotes = D.fetch_quotes(codes, index_codes=[index_code], timeout=6.0)
                 if quotes:
@@ -1334,11 +1337,13 @@ class StockBar:
     def _poll_queue(self):
         if not self.root.winfo_exists():
             return
-        # 看门狗: 取数线程挂死(DNS/网络抖动)超过 20 秒没有消息就自动重启
+        # 看门狗: 取数线程挂死(DNS/网络抖动)超过 20 秒没有消息就自动重启。
+        # 非请求时段(交易时段设置)线程故意静默等待, 不算挂死 —— 刷新看门狗计时即可。
         if self._worker is not None and time.time() - self._last_msg_at > 20.0:
             self._last_msg_at = time.time()
-            self._log("行情线程超时无响应, 自动重启")
-            self._restart_worker(force=True)
+            if self._fetch_allowed():
+                self._log("行情线程超时无响应, 自动重启")
+                self._restart_worker(force=True)
         try:
             while True:
                 kind, *payload = self._q.get_nowait()
@@ -1456,12 +1461,13 @@ class StockBar:
                                       quote_time=q.time)
             total_base += D.day_base_of(h.get("trades"), q.prev_close)
         if not total_base:
-            return 0.0                   # 今日未开始/无持仓: 0, 与今日盈亏口径一致
+            return None                  # 无持仓 / 行情非当日: 不显示持仓段
         return total_pnl / total_base * 100.0
 
     def _total_day_pnl(self):
         """持仓当日盈亏合计(元): 老仓按昨收、当日新买按买入价(见 D.day_pnl_of)。"""
         total = 0.0
+        counted = 0
         holdings = self.cfg.get("holdings", {})
         codes = [c for c in self.pick_codes if c]
         for c in holdings:
@@ -1475,8 +1481,9 @@ class StockBar:
             pos, _ = D.position_of(h.get("trades"))
             if pos.lots <= 0 and not D.sold_today(h.get("trades")):
                 continue                 # 今日清仓也计入(今天亏的钱就是今天的)
+            counted += 1
             total += D.day_pnl_of(h.get("trades"), q.price, q.prev_close, quote_time=q.time)
-        return total
+        return total if counted else None
 
     def _collect_auction(self, quotes: dict):
         """集合竞价(9:15–9:25)采样 —— 复用行情轮询, 不额外请求网络。
@@ -1665,9 +1672,12 @@ class StockBar:
 
         落盘: auction_data/YYYY-MM-DD.json —— 每天几 KB ~ 几十 KB, 不影响性能;
         同一天多次启动会合并而不是覆盖; 任何异常都静默吞掉(攒数据不打扰用户)。
-        force=True: 退出时兜底, 不受 9:25 时间限制。
+        force=True: 退出时兜底, 不受"今日已存"与 9:25 限制(内存里可能有未落盘的采样)。
         """
-        if not self._auction or getattr(self, "_auction_saved", "") == time.strftime("%Y-%m-%d"):
+        if not self._auction:
+            return
+        today = time.strftime("%Y-%m-%d")
+        if not force and getattr(self, "_auction_saved", "") == today:
             return
         if not force and time.localtime().tm_hour * 60 + time.localtime().tm_min < 9 * 60 + 25:
             return
@@ -1768,13 +1778,6 @@ class StockBar:
                                 "command": lambda c=code: self._select_pick(c)})
         if stock_items:
             items.append({"type": "sub", "label": "切换股票", "items": stock_items})
-        iv_items = []
-        for sec in INTERVALS:
-            iv_items.append({"type": "check", "label": f"{sec:g} 秒",
-                             "checked": abs(self.cfg["interval_seconds"] - sec) < 1e-6,
-                             "checked_fn": (lambda s=sec: abs(self.cfg["interval_seconds"] - s) < 1e-6),
-                             "command": lambda s=sec: self.set_interval(s)})
-        items.append({"type": "sub", "label": "刷新间隔", "items": iv_items})
         items.append({"type": "check", "label": "窗口置顶", "checked": bool(self.cfg["topmost"]),
                       "checked_fn": lambda: bool(self.cfg["topmost"]),
                       "command": self.toggle_topmost})
@@ -1783,12 +1786,9 @@ class StockBar:
                       "checked_fn": lambda: bool(self.cfg.get("dock_taskbar")),
                       "command": self.toggle_dock})
         items.append({"type": "sep"})
-        items.append({"type": "cmd", "label": "复制当前行情", "shortcut": "Ctrl+C",
-                      "command": self.copy_quotes})
         items.append({"type": "cmd", "label": "回到右下角", "command": self.move_to_corner})
-        items.append({"type": "cmd", "label": "重新加载配置", "shortcut": "F5",
-                      "command": self.reload_config})
-        items.append({"type": "cmd", "label": "编辑配置文件", "command": self.edit_config})
+        items.append({"type": "cmd", "label": "使用帮助…", "shortcut": "F1",
+                      "command": self.open_help})
         items.append({"type": "sep"})
         items.append({"type": "cmd", "label": "退出", "command": self.quit, "danger": True})
         menu = MenuPopup(self.root, items, pal, F, scale=self.scale,
@@ -1910,13 +1910,8 @@ class StockBar:
         self.apply_settings()
         self._log("配置已重新加载")
 
-    def edit_config(self):
-        if not os.path.exists(CONFIG_PATH):
-            self.save_config()
-        try:
-            os.startfile(CONFIG_PATH)
-        except OSError:
-            pass
+    def open_help(self):
+        self._open_dialog("help", lambda: sb_ui.HelpWindow(self))
 
     # ---------- 任务栏嵌入 ----------
     def _dock_pos(self, w: int | None = None, h: int | None = None,
@@ -2018,12 +2013,16 @@ class StockBar:
 
     # ---------- 更新 ----------
     def _start_update_check(self):
-        # 结果落盘缓存: 反复重启不再重复消耗 GitHub API 额度(60 次/小时)
+        # 结果落盘缓存: 反复重启不再重复消耗 GitHub API 额度(60 次/小时)。
+        # 成功结果缓存 6 小时; 失败(null)只缓存 15 分钟 —— 否则一次限流会让
+        # 之后 6 小时都"查不到更新"(低版本用户表现为偶尔能查到偶尔不行)。
         try:
             with open(UPDATE_CACHE, encoding="utf-8") as f:
                 cache = json.load(f)
-            if time.time() - float(cache.get("at", 0)) < 6 * 3600:
-                self._on_update_check(cache.get("info"))
+            info = cache.get("info")
+            ttl = 6 * 3600 if isinstance(info, dict) else 15 * 60
+            if time.time() - float(cache.get("at", 0)) < ttl:
+                self._on_update_check(info)
                 return
         except Exception:
             pass

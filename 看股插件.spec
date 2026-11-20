@@ -19,10 +19,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name='看股插件V1.5.4',
+    exclude_binaries=True,
+    name='看股插件V1.5.5',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,4 +34,13 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='看股插件V1.5.5',
 )

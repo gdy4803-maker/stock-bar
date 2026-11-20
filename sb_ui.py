@@ -6,6 +6,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -28,6 +29,27 @@ def auction_phase(now=None) -> str:
     if 9 * 60 + 25 <= mins < 9 * 60 + 30:
         return "matched"
     return ""
+
+
+def _fit_text(font, text, max_px):
+    """按像素宽度截断文字, 末尾加省略号(标题等固定区域用)。"""
+    text = text or ""
+    if max_px <= 0:
+        return ""
+    if font.measure(text) <= max_px:
+        return text
+    ell = "…"
+    ell_w = font.measure(ell)
+    if ell_w >= max_px:
+        return ell
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if font.measure(text[:mid]) + ell_w <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + ell
 
 
 def _text_run(canvas, x, y, parts, anchor="w"):
@@ -698,13 +720,18 @@ class InfoCard:
 
         # 头部: 名称 / 代码 / 市场
         y = p["head"]
-        c.create_text(pad, y, text=q.name, anchor="nw", fill=pal["text"],
-                      font=fonts.card_title())
-        name_w = fonts.card_title().measure(q.name)
-        c.create_text(pad + name_w + 7 * S, y + 4 * S, text=D.code_digits(q.code),
-                      anchor="nw", fill=pal["muted"], font=fonts.num(-3, False))
         market = D.market_label(q.code, q.is_index)
         badge_w = fonts.tiny().measure(market) + 14 * S
+        code_txt = D.code_digits(q.code)
+        code_w = fonts.num(-3, False).measure(code_txt)
+        # 名称给代码和市场徽标让位: 超长名称截断, 不挤在一起
+        name_max = (w - pad - badge_w) - 10 * S - code_w - 7 * S - pad
+        name_txt = _fit_text(fonts.card_title(), q.name, name_max)
+        c.create_text(pad, y, text=name_txt, anchor="nw", fill=pal["text"],
+                      font=fonts.card_title())
+        name_w = fonts.card_title().measure(name_txt)
+        c.create_text(pad + name_w + 7 * S, y + 4 * S, text=code_txt,
+                      anchor="nw", fill=pal["muted"], font=fonts.num(-3, False))
         draw_round_rect(c, w - pad - badge_w, y + 1 * S, w - pad, y + 19 * S, 9 * S,
                         pal["panel_alt"], pal["border_soft"], 1)
         c.create_text(w - pad - badge_w / 2, y + 10 * S, text=market,
@@ -753,13 +780,13 @@ class InfoCard:
         ]
         if not q.is_index:
             rows.append(("成交量", D.fmt_volume(q.volume), "成交额", D.fmt_amount(q.amount)))
-        col_w = (w - 2 * pad - int(16 * S)) / 2
+        col_w = (w - 2 * pad - int(22 * S)) / 2
         for i, (k1, v1, k2, v2) in enumerate(rows):
             yy = p["grid"] + i * 20 * S
             c.create_text(pad, yy, text=k1, anchor="nw", fill=pal["muted"], font=fonts.label())
             c.create_text(pad + col_w, yy, text=v1, anchor="ne", fill=pal["text_dim"],
                           font=fonts.num(-2, False))
-            x2 = pad + col_w + 16 * S
+            x2 = pad + col_w + 22 * S
             c.create_text(x2, yy, text=k2, anchor="nw", fill=pal["muted"], font=fonts.label())
             c.create_text(w - pad, yy, text=v2, anchor="ne", fill=pal["text_dim"],
                           font=fonts.num(-2, False))
@@ -954,11 +981,12 @@ class InfoCard:
         pad = p["pad"]
         x1, x2 = pad, p["w"] - pad
         y1, y2 = p["chart"], p["chart"] + 64 * S
-        # 图例: 左=分时, 右=买一/卖一报价(价×手)
-        c.create_text(x1, p["legend"], text="分时", anchor="nw", fill=pal["faint"],
+        # 图例: 左=分时, 右=买一/卖一报价(价×手); 同一基线, 避免左右文字高低不齐
+        legend_y = p["legend"] + int(7 * S)
+        c.create_text(x1, legend_y, text="分时", anchor="w", fill=pal["faint"],
                       font=fonts.tiny())
         if q.bid1 > 0 or q.ask1 > 0:
-            _text_run(c, x2, p["legend"] + int(7 * S), [
+            _text_run(c, x2, legend_y, [
                 ("买一 ", fonts.tiny(), pal["faint"]),
                 ("%s×%s" % (D.fmt_price(q.bid1, q.dp),
                             D.fmt_yi_wan(q.bid1 * q.bid1_vol * 100)),
@@ -969,8 +997,8 @@ class InfoCard:
                  fonts.tiny(), pal["neg"]),
             ], anchor="e")
         elif q.prev_close:
-            c.create_text(x2, p["legend"], text="昨收 " + D.fmt_price(q.prev_close, q.dp),
-                          anchor="ne", fill=pal["faint"], font=fonts.tiny())
+            c.create_text(x2, legend_y, text="昨收 " + D.fmt_price(q.prev_close, q.dp),
+                          anchor="e", fill=pal["faint"], font=fonts.tiny())
         c.create_line(x1, y2, x2, y2, fill=pal["border_soft"])
         c.create_line(x1, y1, x1, y2, fill=pal["border_soft"])
 
@@ -1315,7 +1343,7 @@ class SettingsWindow(BaseDialog):
         self.show_name_sw = Switch(r, bool(self.app.cfg["show_name"]),
                                    self._set_show_name, pal, S)
         self.show_name_sw.pack(side="left", pady=2)
-        tk.Label(r, text="行情条里显示股票名称", bg=pal["panel_alt"], fg=pal["faint"],
+        tk.Label(r, text="关闭后只显示涨跌幅", bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "文字不透明度")
         Slider(r, int(round(float(self.app.cfg["opacity"]) * 100)), 10, 100,
@@ -1332,13 +1360,13 @@ class SettingsWindow(BaseDialog):
         sec = self.section(parent, "窗口")
         r = self.row(sec, "窗口置顶")
         Switch(r, bool(self.app.cfg["topmost"]), self._set_topmost, pal, self.S).pack(side="left", pady=2)
-        tk.Label(r, text="行情条始终浮在其他窗口之上", bg=pal["panel_alt"],
+        tk.Label(r, text="始终显示在最前", bg=pal["panel_alt"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "嵌入任务栏")
         self.dock_sw = Switch(r, bool(self.app.cfg.get("dock_taskbar")), self._set_dock,
                               pal, self.S)
         self.dock_sw.pack(side="left", pady=2)
-        tk.Label(r, text="长在任务栏上，可左右拖动", bg=pal["panel_alt"],
+        tk.Label(r, text="固定在任务栏，可左右拖动", bg=pal["panel_alt"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "开机启动")
         self.autostart_sw = Switch(r, bool(self.app.is_autostart()), self._set_autostart,
@@ -1540,8 +1568,6 @@ class SettingsWindow(BaseDialog):
         Segmented(r, [("trading", "交易时段 9-16点"), ("all", "全天请求")],
                   self.app.cfg.get("fetch_mode", "trading"), self._set_fetch_mode,
                   pal, self.fonts).pack(side="left")
-        tk.Label(r, text="收盘后不打接口, 省资源", bg=pal["panel_alt"], fg=pal["faint"],
-                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "右侧指数")
         self.index_var = tk.StringVar(value=self.app.cfg["index"])
         entry = make_entry(r, pal, self.fonts, width=10, textvariable=self.index_var,
@@ -1564,13 +1590,11 @@ class SettingsWindow(BaseDialog):
         Segmented(r, [("money", "金额"), ("pct", "涨幅")],
                   self.app.cfg.get("pnl_display", "money"), self._set_pnl_display,
                   pal, self.fonts).pack(side="left")
-        tk.Label(r, text="行情条中间那段", bg=pal["panel_alt"], fg=pal["faint"],
-                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
         r = self.row(sec, "详情卡")
         Segmented(r, [("simple", "简洁"), ("detail", "详细")],
                   self.app.cfg.get("card_mode", "detail"), self._set_card_mode,
                   pal, self.fonts).pack(side="left")
-        tk.Label(r, text="简洁 = 不含分时图", bg=pal["panel_alt"], fg=pal["faint"],
+        tk.Label(r, text="简洁版不含分时图", bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
 
     # ---- 交易手续费 ----
@@ -1633,12 +1657,12 @@ class SettingsWindow(BaseDialog):
     def _build_ai(self, parent):
         """AI 研判(大模型)设置: 启用开关 / 服务商 / 接口 / 模型 / Key。"""
         pal = self.pal
-        sec = self.section(parent, "AI 研判（大模型）")
+        sec = self.section(parent, "AI 研判")
         r0 = self.row(sec, "自动研判")
         sw = Switch(r0, bool(self.app.cfg.get("llm_enabled")),
                     lambda v: self._set_cfg("llm_enabled", bool(v)), pal, self.S)
         sw.pack(side="left")
-        tk.Label(r0, text="开启后: 9:25 后自动研判一次 + 评分卡出现「AI 研判」按钮",
+        tk.Label(r0, text="开启后 9:25 自动研判一次",
                  anchor="w", bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
 
@@ -1651,7 +1675,7 @@ class SettingsWindow(BaseDialog):
         def field(label, key, placeholder=""):
             r = self.row(sec, label)
             var = tk.StringVar(value=str(self.app.cfg.get(key) or ""))
-            ent = make_entry(r, pal, self.fonts, width=26, textvariable=var)
+            ent = make_entry(r, pal, self.fonts, width=20, textvariable=var)
             ent.pack(side="left", fill="x", expand=True, ipady=4)
             if placeholder:
                 tk.Label(r, text=placeholder, bg=pal["panel_alt"], fg=pal["faint"],
@@ -1662,7 +1686,7 @@ class SettingsWindow(BaseDialog):
 
         self._llm_base_var = field("接口地址", "llm_base")
         self._llm_model_var = field("模型名", "llm_model")
-        self._llm_key_var = field("API Key", "llm_key", "或环境变量")
+        self._llm_key_var = field("API Key", "llm_key", "可留空")
 
     def _set_llm_provider(self, name: str):
         preset = D.LLM_PRESETS.get(name) or {}
@@ -1681,17 +1705,16 @@ class SettingsWindow(BaseDialog):
         items = [("悬停", "查看分时与持仓详情"), ("左键", "切换下一只自选"),
                  ("→ / ←", "切换自选"), ("右键", "打开菜单"),
                  ("1 / 2 / 3", "换卡片：个股 / 持仓总览 / 竞价评分"),
-                 ("Ctrl + Shift + S", "打开设置"), ("F5", "重新加载配置"),
-                 ("Ctrl + M", "管理自选股"), ("Ctrl + H", "持仓设置"),
+                 ("Ctrl+Shift+S", "打开设置"), ("F5", "重新加载配置"),
+                 ("Ctrl+M", "管理自选股"), ("Ctrl+H", "持仓设置"),
                  ("Esc", "关闭窗口/卡片")]
         for k, v in items:
-            r = self.row(sec, k)
+            r = self.row(sec, k, label_width=108)
             tk.Label(r, text=v, anchor="w", bg=pal["panel_alt"],
                      fg=pal["text_dim"], font=self.fonts.label()).pack(side="left")
-        tk.Label(sec, text=("说明：按 1 / 2 / 3 换卡片时，鼠标指针要放在下面的悬浮行情条上才有效；"
-                            "鼠标一移开，卡片就自动关闭。"),
+        tk.Label(sec, text=("按 1 / 2 / 3 换卡片时，鼠标需停在行情条上；移开即关闭。"),
                  anchor="w", justify="left", bg=pal["panel_alt"], fg=pal["faint"],
-                 font=self.fonts.tiny(), wraplength=int(560 * self.S)).pack(
+                 font=self.fonts.tiny(), wraplength=int(320 * self.S)).pack(
             fill="x", padx=14, pady=(2, 12))
 
     def _build_tips(self, parent):
@@ -1699,9 +1722,7 @@ class SettingsWindow(BaseDialog):
         sec = self.section(parent, "小提示")
         for text in ("按住左键拖动，可放到任务栏上悬浮",
                      "悬停片刻显示分时与持仓详情",
-                     "背景不透明度调到 0% 只显示文字",
-                     "卡片透明度可让悬停详情卡半透明",
-                     "嵌入任务栏后可左右拖动换位置"):
+                     "背景不透明度 0% = 纯文字模式"):
             r = tk.Frame(sec, bg=pal["panel_alt"])
             r.pack(fill="x", pady=2)
             tk.Label(r, text="·", bg=pal["panel_alt"], fg=pal["accent"],
@@ -1892,9 +1913,14 @@ class SupportDialog(BaseDialog):
     key = "support"
 
     def __init__(self, app):
-        super().__init__(app, "支持开发者", 300, 400, min_size=(240, 300))
+        super().__init__(app, "支持开发者", 300, 416, min_size=(240, 300))
         self.header("感谢支持", "欢迎扫码")
         pal = self.pal
+        # 先放底部按钮栏, 再让内容区填充剩余空间(后 pack 的底部栏会被挤出窗口)
+        foot = tk.Frame(self.body, bg=pal["panel"])
+        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
+        CanvasButton(foot, "关闭", self.close, pal, self.fonts, kind="primary",
+                     width=84, height=32, scale=self.S).pack(side="right")
         body = tk.Frame(self.body, bg=pal["panel"])
         body.pack(fill="both", expand=True, pady=(4, 0))
         self._qr_card = tk.Frame(body, bg=pal["card_bg"],
@@ -1913,15 +1939,10 @@ class SupportDialog(BaseDialog):
                                      bg=pal["card_bg"], fg=pal["muted"],
                                      font=self.fonts.label(), justify="center")
             self.qr_label.pack(padx=28, pady=50)
-        tk.Label(body, text="微信扫码 · 韩 的赞赏码", bg=pal["panel"], fg=pal["text_dim"],
+        tk.Label(body, text="微信扫码 · 韩的赞赏码", bg=pal["panel"], fg=pal["text_dim"],
                  font=self.fonts.label()).pack()
         tk.Label(body, text="你的支持是持续更新的动力 ♥", bg=pal["panel"],
                  fg=pal["muted"], font=self.fonts.tiny()).pack(pady=(3, 0))
-
-        foot = tk.Frame(self.body, bg=pal["panel"])
-        foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
-        CanvasButton(foot, "关闭", self.close, pal, self.fonts, kind="primary",
-                     width=84, height=32, scale=self.S).pack(side="right")
 
         # 二维码随窗口缩放(防抖)
         self._qr_job = None
@@ -1962,6 +1983,426 @@ class SupportDialog(BaseDialog):
             pass
 
 
+# ---------------- 使用帮助 ----------------
+class HelpWindow(BaseDialog):
+    """详细使用教程: 分组卡片 + 可滚动正文, 支持 F1 / 右键菜单打开。"""
+
+    key = "help"
+
+    def __init__(self, app):
+        super().__init__(app, "使用帮助", 880, 800, min_size=(660, 540))
+        self._wrap_items = []
+        self._build_footer()
+        self.header("使用帮助", "从快速上手到进阶功能，一页看懂")
+        body = self._build_scroll_body()
+        self._build_quick_start(body)
+        self._build_bar(body)
+        self._build_menu(body)
+        self._build_settings(body)
+        self._build_watchlist(body)
+        self._build_holdings(body)
+        self._build_cards(body)
+        self._build_tools(body)
+        self._build_data(body)
+        self._build_shortcuts(body)
+        self._build_faq(body)
+        self.win.bind("<MouseWheel>", self._on_mousewheel)
+        self.win.after_idle(self._sync_scroll_region)
+        self.win.after_idle(self._refresh_wrap)
+
+    # ---- 滚动与排版 ----
+    def _build_footer(self):
+        pal = self.pal
+        foot = tk.Frame(self.body, bg=pal["panel"])
+        foot.pack(fill="x", side="bottom", padx=18, pady=(4, 12))
+        CanvasButton(foot, "打开程序目录", self._open_dir, pal, self.fonts,
+                     kind="ghost", width=112, height=32, scale=self.S).pack(side="left")
+        self._dir_hint = tk.Label(foot, text="配置与数据都在程序目录", bg=pal["panel"],
+                                  fg=pal["faint"], font=self.fonts.tiny())
+        self._dir_hint.pack(side="left", padx=(12, 0))
+        CanvasButton(foot, "关闭", self.close, pal, self.fonts,
+                     kind="primary", width=84, height=32, scale=self.S).pack(side="right")
+
+    def _build_scroll_body(self):
+        pal = self.pal
+        setup_ttk(self.win, pal, self.fonts, self.S)
+        wrap = tk.Frame(self.body, bg=pal["panel"])
+        wrap.pack(fill="both", expand=True, padx=18, pady=(12, 6))
+        self._canvas = tk.Canvas(wrap, bg=pal["panel"], highlightthickness=0, bd=0)
+        self._scroll = ttk.Scrollbar(wrap, orient="vertical",
+                                     command=self._canvas.yview,
+                                     style="SB.Vertical.TScrollbar")
+        self._canvas.configure(yscrollcommand=self._scroll.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._scroll.pack(side="right", fill="y")
+        inner = tk.Frame(self._canvas, bg=pal["panel"])
+        self._inner = inner
+        self._item = self._canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: self._sync_scroll_region())
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+        return inner
+
+    def _on_canvas_resize(self, event):
+        try:
+            self._canvas.itemconfigure(self._item, width=event.width)
+        except (tk.TclError, AttributeError):
+            pass
+        self._refresh_wrap(event.width)
+        self._sync_scroll_region()
+
+    def _sync_scroll_region(self):
+        try:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _refresh_wrap(self, width=None):
+        if width is None:
+            try:
+                width = self._canvas.winfo_width()
+            except tk.TclError:
+                return
+        for lab, text, font, indent in self._wrap_items:
+            try:
+                lab.configure(text=self._wrap_px(text, font,
+                                                max(180, width - 72 * self.S - indent)),
+                              wraplength=0)
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _wrap_px(text, font, max_px):
+        """按像素宽度逐字换行: Tk 的 wraplength 只在空格处断行, 中文长句会溢出。"""
+        if max_px <= 24:
+            return text
+        out = []
+        for para in str(text).split("\n"):
+            line = ""
+            for token in re.findall(r"[A-Za-z0-9_./:%~+\-]+|[\u4e00-\u9fff]|.", para):
+                cand = line + token
+                if font.measure(cand) <= max_px:
+                    line = cand
+                    continue
+                if line.strip():
+                    out.append(line.rstrip())
+                if font.measure(token) > max_px:
+                    chunk = ""
+                    for ch in token:
+                        if font.measure(chunk + ch) <= max_px:
+                            chunk += ch
+                        else:
+                            if chunk:
+                                out.append(chunk)
+                            chunk = ch
+                    line = chunk
+                else:
+                    line = token.lstrip()
+            out.append(line.rstrip())
+        return "\n".join(out)
+
+    def _on_mousewheel(self, event):
+        try:
+            if self._canvas.winfo_exists():
+                self._canvas.yview_scroll(int(-1 * (event.delta / 120) * 3), "units")
+        except (tk.TclError, AttributeError, TypeError):
+            pass
+
+    def _card(self, parent, number, title):
+        pal, F = self.pal, self.fonts
+        card = tk.Frame(parent, bg=pal["panel_alt"],
+                        highlightbackground=pal["border"], highlightthickness=1)
+        card.pack(fill="x", pady=(0, 12))
+        head = tk.Frame(card, bg=pal["panel_alt"])
+        head.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(head, text=number, bg=pal["panel_alt"], fg=pal["accent"],
+                 font=F.num(-1, True), width=3, anchor="w").pack(side="left")
+        tk.Label(head, text=title, bg=pal["panel_alt"], fg=pal["text"],
+                 font=F.ui(1, True), anchor="w").pack(side="left")
+        tk.Frame(card, bg=pal["border_soft"], height=1).pack(fill="x", padx=14, pady=(3, 7))
+        inner = tk.Frame(card, bg=pal["panel_alt"])
+        inner.pack(fill="x", padx=(42, 18), pady=(0, 11))
+        return inner
+
+    def _p(self, parent, text, color=None, indent=0, pady=(0, 6)):
+        font = self.fonts.ui(-1)
+        lab = tk.Label(parent, text=text, bg=self.pal["panel_alt"],
+                       fg=color or self.pal["text_dim"], font=font,
+                       anchor="w", justify="left",
+                       wraplength=max(220, int(650 * self.S)))
+        lab.pack(fill="x", pady=pady)
+        self._wrap_items.append((lab, text, font, int(indent * self.S)))
+        return lab
+
+    def _sub(self, parent, text):
+        lab = tk.Label(parent, text=text, bg=self.pal["panel_alt"],
+                       fg=self.pal["muted"], font=self.fonts.ui(0, True),
+                       anchor="w", justify="left")
+        lab.pack(fill="x", pady=(9, 3))
+        return lab
+
+    def _bullet(self, parent, text):
+        row = tk.Frame(parent, bg=self.pal["panel_alt"])
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text="·", bg=self.pal["panel_alt"], fg=self.pal["accent"],
+                 font=self.fonts.ui(-1, True)).pack(side="left", anchor="n")
+        font = self.fonts.ui(-1)
+        lab = tk.Label(row, text=text, bg=self.pal["panel_alt"],
+                       fg=self.pal["text_dim"], font=font,
+                       anchor="w", justify="left",
+                       wraplength=max(220, int(650 * self.S)))
+        lab.pack(side="left", fill="x", expand=True, padx=(7, 0))
+        self._wrap_items.append((lab, text, font, int(20 * self.S)))
+
+    def _step(self, parent, num, text):
+        row = tk.Frame(parent, bg=self.pal["panel_alt"])
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=f"{num}.", bg=self.pal["panel_alt"], fg=self.pal["accent"],
+                 font=self.fonts.num(-1, True), width=2, anchor="w").pack(side="left", anchor="n")
+        font = self.fonts.ui(-1)
+        lab = tk.Label(row, text=text, bg=self.pal["panel_alt"],
+                       fg=self.pal["text_dim"], font=font,
+                       anchor="w", justify="left",
+                       wraplength=max(220, int(650 * self.S)))
+        lab.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self._wrap_items.append((lab, text, font, int(26 * self.S)))
+
+    def _kv(self, parent, key, value):
+        row = tk.Frame(parent, bg=self.pal["panel_alt"])
+        row.pack(fill="x", pady=2)
+        holder = tk.Frame(row, bg=self.pal["panel_alt"], width=int(170 * self.S))
+        holder.pack(side="left", fill="y")
+        holder.pack_propagate(False)
+        tk.Label(holder, text=key, bg=self.pal["panel_alt"], fg=self.pal["text"],
+                 font=self.fonts.ui(-1, True), anchor="w").pack(side="left")
+        font = self.fonts.ui(-1)
+        lab = tk.Label(row, text=value, bg=self.pal["panel_alt"],
+                       fg=self.pal["text_dim"], font=font,
+                       anchor="w", justify="left",
+                       wraplength=max(220, int(650 * self.S)))
+        lab.pack(side="left", fill="x", expand=True)
+        self._wrap_items.append((lab, value, font, int(170 * self.S)))
+
+    def _open_dir(self):
+        try:
+            os.startfile(getattr(self.app, "base_dir", "") or ".")
+            self._dir_hint.config(text="已打开程序目录", fg=self.pal["text_dim"])
+        except Exception:
+            self._dir_hint.config(text="打开失败，请手动定位程序目录", fg=self.pal["warn"])
+
+    # ---- 01 快速开始 ----
+    def _build_quick_start(self, parent):
+        sec = self._card(parent, "01", "快速开始")
+        self._p(sec, f"双击 看股插件V{self.app.version}.exe 即可运行，免安装。"
+                     "首次启动会在程序目录生成 config.json，自选、持仓和所有设置都存在这里。")
+        self._step(sec, 1, "启动后行情条默认位于屏幕右下角。按住左键可拖到任意位置；"
+                           "拖到任务栏会自动吸附。")
+        self._step(sec, 2, "行情条分三段：左边是当前自选股，中间是持仓当日盈亏，"
+                           "右边是自选指数。没有持仓时中间段自动隐藏。")
+        self._step(sec, 3, "鼠标悬停分区看详情；单击左边个股段切换下一只；右键打开功能菜单。")
+        self._p(sec, "建议第一次使用按这个顺序设置：外观与字号 → 管理自选股 → 持仓设置 → "
+                     "需要时再配置 AI 研判。", color=self.pal["muted"], pady=(6, 0))
+
+    # ---- 02 行情条 ----
+    def _build_bar(self, parent):
+        sec = self._card(parent, "02", "行情条怎么用")
+        self._sub(sec, "悬停查看详情")
+        self._bullet(sec, "个股段：分时图、现价/涨跌、买一卖一；简洁模式下不显示分时图。")
+        self._bullet(sec, "持仓段：持仓总览，列出每只持仓的成本、浮动盈亏、今日盈亏和汇总。")
+        self._bullet(sec, "指数段：指数分时与涨跌；指数代码可在设置里改。")
+        self._sub(sec, "点击与拖动")
+        self._bullet(sec, "单击个股段：切换到下一只自选股；单击持仓段：在“金额 / 涨幅”之间切换。")
+        self._bullet(sec, "按住左键拖动：移动行情条；拖到任务栏会自动吸附并记住位置。")
+        self._bullet(sec, "指数段不响应单击，避免误触。")
+        self._sub(sec, "常用键盘操作")
+        self._bullet(sec, "← / → / ↑ / ↓：切换自选股。")
+        self._bullet(sec, "1 / 2 / 3：切换个股 / 持仓总览 / 竞价评分卡；鼠标需停在行情条上。")
+        self._bullet(sec, "Esc：关闭当前详情卡；T：打开竞价卡并立即 AI 研判。")
+
+    # ---- 03 菜单 ----
+    def _build_menu(self, parent):
+        sec = self._card(parent, "03", "右键菜单逐项说明")
+        self._p(sec, "在行情条上点右键打开。带勾选的项（窗口置顶、嵌入任务栏等）点击后就地翻转，"
+                     "菜单不会立刻关闭，方便连续调整。")
+        for key, value in (
+                ("设置…", "外观、窗口、行情、手续费、AI、更新，改动立即生效。"),
+                ("管理自选股…", "搜索、添加、移除、上下排序；保存后立即生效。"),
+                ("自选强弱排序…", "按 60 日相对强度与竞价评分给自选排序。"),
+                ("收盘选股…", "勾选策略，扫描全市场，结果双击可加入自选。"),
+                ("当日异动扫描…", "筛选涨幅 ≥4% 且成交额 ≥2 亿的股票，双击加自选。"),
+                ("持仓设置…", "模拟盘买卖记录，自动计算持仓、浮动与今日盈亏。"),
+                ("切换股票", "子菜单直接选择当前显示的股票。"),
+                ("窗口置顶", "勾选后始终显示在其他窗口之上。"),
+                ("嵌入任务栏（左）", "勾选后固定在任务栏，可左右拖动；开启时自动找空位。"),
+                ("回到右下角", "位置跑偏或换显示器后，一键回到右下角。"),
+                ("使用帮助", "打开本教程；也可直接按 F1。"),
+                ("退出", "保存配置并退出程序。"),
+        ):
+            self._kv(sec, key, value)
+        self._p(sec, "刷新间隔在「设置 → 行情」里调整；复制行情按 Ctrl+C；"
+                     "重新加载配置按 F5。", color=self.pal["muted"], pady=(6, 0))
+
+    # ---- 04 设置 ----
+    def _build_settings(self, parent):
+        sec = self._card(parent, "04", "设置页：每个选项做什么")
+        self._sub(sec, "外观")
+        self._bullet(sec, "显示样式：胶囊 = 名称 + 涨跌幅 + 持仓 + 指数；紧凑 = 更短，只保留涨跌幅与盈亏。")
+        self._bullet(sec, "界面配色：深色 / 浅色；字号 10 / 12 / 14 / 16。")
+        self._bullet(sec, "显示名称：关闭后自选段只显示涨跌幅，适合极简桌面。")
+        self._bullet(sec, "文字 / 背景 / 卡片不透明度：背景调到 0% 就是纯文字模式。")
+        self._sub(sec, "窗口")
+        self._bullet(sec, "窗口置顶：始终显示在最前。")
+        self._bullet(sec, "嵌入任务栏：固定在任务栏；开启时自动避开已有图标，之后跟随宽度不搬家。")
+        self._bullet(sec, "开机启动：登录 Windows 后自动运行；被安全软件拦截时会弹出处理办法。")
+        self._sub(sec, "行情")
+        self._bullet(sec, "刷新间隔：0.5–10 秒；网络一般时建议 2–3 秒。")
+        self._bullet(sec, "请求时段：交易时段 9–16 点（收盘和周末不请求，省资源）/ 全天请求。")
+        self._bullet(sec, "右侧指数：填指数代码，如 sh000001（上证）或 sz399001（深证成指）。")
+        self._bullet(sec, "涨跌配色：红涨绿跌 / 绿涨红跌。")
+        self._bullet(sec, "持仓显示：金额 / 涨幅；也可以单击行情条中间段快速切换。")
+        self._bullet(sec, "详情卡：简洁（不含分时图）/ 详细（分时、买卖一、OHLC、量额）。")
+        self._sub(sec, "交易手续费")
+        self._bullet(sec, "股票佣金、ETF 佣金、卖出印花税；持仓窗口按这里的费率自动估算费用。")
+        self._sub(sec, "AI 研判")
+        self._bullet(sec, "自动研判：开启后 9:25 对当前股票自动跑一次，每天一次。")
+        self._bullet(sec, "服务商：DeepSeek / MIMO / 自定义（OpenAI 兼容接口）。")
+        self._bullet(sec, "接口地址、模型名、API Key；Key 可留空，程序会读环境变量 STOCKBAR_LLM_KEY。")
+        self._sub(sec, "更新与支持")
+        self._bullet(sec, "更新：显示当前版本，可立即检查；发现新版本时出现“更新”按钮。")
+        self._bullet(sec, "支持开发者：扫码窗；源码仓库：一键复制地址。")
+
+    # ---- 05 自选 ----
+    def _build_watchlist(self, parent):
+        sec = self._card(parent, "05", "管理自选股")
+        self._step(sec, 1, "右键菜单「管理自选股…」，或按 Ctrl+M 打开。")
+        self._step(sec, 2, "在搜索框输入名称、代码或拼音首字母，如 茅台、510300、gzmt；"
+                           "稍等片刻出现结果。")
+        self._step(sec, 3, "选中结果后点「添加 →」加入右侧列表；选中已有项可「← 移除」。")
+        self._step(sec, 4, "用「↑ 上移 / ↓ 下移」调整顺序；列表顺序就是行情条切换顺序。")
+        self._step(sec, 5, "点「保存并应用」立即生效，无需重启。")
+        self._p(sec, "建议自选控制在 5–15 只：太多会拉长切换路径，也会增加每次刷新请求量。",
+                color=self.pal["muted"], pady=(6, 0))
+
+    # ---- 06 持仓 ----
+    def _build_holdings(self, parent):
+        sec = self._card(parent, "06", "持仓设置（模拟盘）")
+        self._p(sec, "这里只是本地模拟记账，不连接券商、不会下单。交易对象来自自选股列表与已有持仓；"
+                     "新股票请先加入自选。")
+        self._step(sec, 1, "右键菜单「持仓设置…」，或按 Ctrl+H 打开。")
+        self._step(sec, 2, "在上方持仓明细中选中一只股票；选中后价格会自动填入当前价。")
+        self._step(sec, 3, "填写成交价与数量（单位：手，1 手 = 100 股），备注可留空。")
+        self._step(sec, 4, "点「买入 / 卖出」记录成交；在输入框按回车等于买入。卖出可用「全部卖出」。")
+        self._step(sec, 5, "费用按设置里的佣金、起收、印花税自动计算，不需要手工填。")
+        self._p(sec, "盈亏口径：老仓按昨收、今日买入按买价计算今日盈亏；卖出按 FIFO 先消耗最早份额。"
+                     "清仓后仍保留已实现盈亏，今日清仓的股票也会显示在列表里。",
+                color=self.pal["muted"])
+        self._bullet(sec, "「删除所选记录」可撤销误录的成交，持仓与盈亏会立即重算。")
+        self._bullet(sec, "两个列表之间的横条可上下拖动，窗口大小与布局会自动记住。")
+        self._bullet(sec, "空表会显示「暂无持仓」或「暂无成交记录」，不是加载失败。")
+
+    # ---- 07 卡片与 AI ----
+    def _build_cards(self, parent):
+        sec = self._card(parent, "07", "详情卡、竞价评分与 AI")
+        self._sub(sec, "三种卡片")
+        self._bullet(sec, "个股卡：悬停个股段，或用 1；显示分时、买卖一、现价与涨跌。")
+        self._bullet(sec, "持仓总览：悬停持仓段，或用 2；每只持仓 + 底部汇总。")
+        self._bullet(sec, "竞价评分：按 3；9:15–9:25 显示实时竞价，其他时段显示当日或最近一次评分。")
+        self._p(sec, "按 1 / 2 / 3 时鼠标必须停在行情条上；移开卡片会自动关闭。"
+                     "按 Esc 可立即关闭。", color=self.pal["muted"])
+        self._sub(sec, "竞价评分")
+        self._bullet(sec, "5 项可解释评分：高开幅度、撮合趋势、买卖力量、量价配合、价格稳定。")
+        self._bullet(sec, "顶部徽章给出偏多 / 中性 / 偏空；红色偏多、绿色偏空，跟随涨跌配色设置。")
+        self._bullet(sec, "评分是规则计算，不依赖大模型；没有配置 AI 也能使用。")
+        self._sub(sec, "AI 研判")
+        self._bullet(sec, "在设置里填服务商、接口、模型、API Key；开启“自动研判”后 9:25 自动跑一次。")
+        self._bullet(sec, "也可在竞价卡上点「AI 研判」，或悬停时按 T 立即研判当前股票。")
+        self._bullet(sec, "输出包含综合研判、核心理由、风险、操作倾向；需要联网，通常几秒到几十秒。")
+        self._p(sec, "AI 与评分都只作为辅助信息，不构成投资建议。", color=self.pal["warn"])
+
+    # ---- 08 选股工具 ----
+    def _build_tools(self, parent):
+        sec = self._card(parent, "08", "收盘选股、强弱排序、异动扫描")
+        self._sub(sec, "收盘选股")
+        self._bullet(sec, "7 个策略可勾选：海龟突破、RPS 突破、放量突破、高窄旗形、涨停洗盘、跌停反包、强势回调。")
+        self._bullet(sec, "先全市场初筛，再对候选做深度分析；候选数量可设 5–500，越大越慢。")
+        self._bullet(sec, "命中策略越多越可靠；结果会列出每条策略的依据，双击一行可加入自选。")
+        self._bullet(sec, "勾选策略与候选数量会自动记住；运行期间请耐心等待，可随时关闭窗口。")
+        self._sub(sec, "自选强弱排序")
+        self._bullet(sec, "按 60 日跑赢沪深 300 的幅度（RPS 近似）与竞价评分排序。")
+        self._bullet(sec, "同时给出 20 日跑赢、形态/强度提示；数据缓存 30 分钟，点「刷新」可重算。")
+        self._sub(sec, "当日异动扫描")
+        self._bullet(sec, "全市场筛选涨幅 ≥4% 且成交额 ≥2 亿，按涨幅降序，最多显示 40 只。")
+        self._bullet(sec, "双击一行直接加入自选；已在自选中的会提示，不会重复添加。")
+        self._p(sec, "选股与扫描结果仅供筛选参考，不构成买卖建议；行情接口免费，可能存在延迟。",
+                color=self.pal["warn"])
+
+    # ---- 09 数据 ----
+    def _build_data(self, parent):
+        sec = self._card(parent, "09", "更新、配置与数据")
+        self._sub(sec, "更新")
+        self._bullet(sec, "启动时静默检查新版本，结果缓存 6 小时；发现新版本时右键菜单顶部会出现更新入口。")
+        self._bullet(sec, "点「更新」会自动下载、校验、解压并重启到新版；配置文件不变，失败自动回滚。")
+        self._bullet(sec, "也可以手动下载新包：退出程序，只替换 exe 与 _internal，保留自己的 config.json。")
+        self._sub(sec, "程序目录里的文件")
+        self._kv(sec, "config.json", "自选、持仓、外观、AI、手续费等全部设置；首次运行自动生成。")
+        self._kv(sec, "config.json.bak", "配置损坏时的自动备份；可用它恢复。")
+        self._kv(sec, "stock_bar.log", "运行日志；行情异常、窗口报错时先看这里。")
+        self._kv(sec, "auction_data\\", "每日竞价存档与 weights.json（评分权重），用于复盘和自动训练。")
+        self._kv(sec, "update_cache.json", "更新检查缓存；删除后会重新检查。")
+        self._kv(sec, "stock_bar.lock", "单实例锁；程序运行期间存在，退出后自动删除。")
+        self._sub(sec, "手动改配置")
+        self._p(sec, "高级用户仍可直接编辑 config.json：先退出程序并备份，保存为 UTF-8，"
+                     "再启动；已运行时按 F5 可重新加载。JSON 写错会被忽略并回退默认值。",
+                color=self.pal["muted"])
+        self._p(sec, "整个文件夹可直接复制到另一台电脑，配置与持仓一起带走。", color=self.pal["muted"])
+
+    # ---- 10 快捷键 ----
+    def _build_shortcuts(self, parent):
+        sec = self._card(parent, "10", "快捷键一览")
+        for key, value in (
+                ("F1", "打开本使用帮助"),
+                ("Ctrl+Shift+S", "打开设置"),
+                ("Ctrl+M", "管理自选股"),
+                ("Ctrl+H", "持仓设置"),
+                ("Ctrl+C", "复制当前行情（需先点一下行情条）"),
+                ("F5", "重新加载 config.json"),
+                ("← / → / ↑ / ↓", "切换上一只 / 下一只自选"),
+                ("1 / 2 / 3", "个股卡 / 持仓总览 / 竞价评分卡"),
+                ("T", "竞价卡 + 立即 AI 研判"),
+                ("Esc", "关闭详情卡或当前窗口"),
+        ):
+            self._kv(sec, key, value)
+        self._p(sec, "1 / 2 / 3 / T 需要鼠标停在行情条上；Ctrl 系列快捷键需要先让行情条获得焦点"
+                     "（单击一下即可）。", color=self.pal["muted"], pady=(6, 0))
+
+    # ---- 11 FAQ ----
+    def _build_faq(self, parent):
+        sec = self._card(parent, "11", "常见问题")
+        for q, a in (
+                ("行情不刷新 / 收盘后不动",
+                 "设置 → 行情 → 请求时段改成「全天请求」；交易时段模式下 16 点后和周末不请求。"),
+                ("行情条找不到了",
+                 "右键菜单「回到右下角」；换显示器后也用它复位。"),
+                ("文字看不清 / 背景太透",
+                 "设置 → 外观：提高文字不透明度或字号；背景不透明度调到 0% 可得纯文字模式。"),
+                ("任务栏位置被图标挡住",
+                 "关闭再开启「嵌入任务栏」，让它重新找空位；或直接拖到空位。"),
+                ("开机自启失败",
+                 "多为安全软件启动项防护。把程序目录加入信任区，或手动把快捷方式放进启动文件夹。"),
+                ("更新失败",
+                 "多为网络或 GitHub 限流。稍后重试，或手动下载 zip，只替换 exe 与 _internal。"),
+                ("持仓盈亏显示 -- 或 0",
+                 "没有持仓、非交易时段或行情尚未就绪时会这样；开盘后会自动更新。"),
+                ("被杀毒软件报毒",
+                 "打包 exe 常被误报。确认来自本项目发布页后，把程序目录加入信任区。"),
+                ("能否多开",
+                 "不建议。程序用 stock_bar.lock 限制单实例，多开会争抢配置与日志。"),
+        ):
+            self._p(sec, "Q： " + q, color=self.pal["text"], pady=(6, 1))
+            self._p(sec, "A： " + a, color=self.pal["text_dim"], pady=(0, 2))
+        self._p(sec, "数据来自免费公开行情接口，可能有延迟；所有评分、选股与 AI 结论仅供参考，"
+                     "不构成投资建议。", color=self.pal["warn"], pady=(10, 0))
+
+
 # ---------------- 自选股管理 ----------------
 def _section_card(parent, title, pal, fonts, scale):
     """通用卡片容器(标题 + 内容区), 供各窗口复用; 自动铺满 parent。"""
@@ -1975,6 +2416,26 @@ def _section_card(parent, title, pal, fonts, scale):
     return inner
 
 
+def _tree_hint(tree, text, pal, fonts):
+    """空表格占位提示: 叠在表格中心并置顶。"""
+    lab = tk.Label(tree, text=text, bg=pal["panel_soft"], fg=pal["faint"],
+                   font=fonts.label())
+    lab.place(relx=0.5, rely=0.5, anchor="center")
+    lab.lift()
+    return lab
+
+
+def _hint_show(lab, show):
+    try:
+        if show:
+            lab.place(relx=0.5, rely=0.5, anchor="center")
+            lab.lift()
+        else:
+            lab.place_forget()
+    except tk.TclError:
+        pass
+
+
 class SelectWindow(BaseDialog):
     """收盘选股: 策略可勾选(海龟/RPS/放量/旗形等), 双击加自选。"""
     key = "select"
@@ -1982,7 +2443,7 @@ class SelectWindow(BaseDialog):
     def __init__(self, app):
         super().__init__(app, "收盘选股", 900, 720)
         setup_ttk(self.win, self.pal, self.fonts, self.S)     # 表格样式跟随主题
-        self.header("收盘选股", "全市场初筛 + 策略命中, 收盘后跑效果最好; 双击一行加入自选")
+        self.header("收盘选股", "全市场初筛＋策略命中，收盘后运行效果最好；双击一行加入自选")
         pal = self.pal
         # 先占住底部按钮栏, 再让内容区填充(否则按钮会被挤出可视区)
         foot = tk.Frame(self.body, bg=pal["panel"])
@@ -2012,12 +2473,12 @@ class SelectWindow(BaseDialog):
         ent = make_entry(row2, pal, self.fonts, width=6, textvariable=self.depth_var,
                          numeric=True)
         ent.pack(side="left", ipady=3, padx=(6, 6))
-        tk.Label(row2, text="(深入分析的候选数 5~500; 初筛已覆盖全市场, 深度越大越慢)",
+        tk.Label(row2, text="候选 5~500，越大越慢",
                  bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(side="left")
         CanvasButton(row2, "开始选股", self._start, pal, self.fonts, kind="primary",
-                     width=104, height=32, scale=self.S).pack(side="left")
-        self.status = tk.Label(row2, text="勾选策略后点「开始选股」", bg=pal["panel_alt"],
+                     width=104, height=32, scale=self.S).pack(side="left", padx=(14, 0))
+        self.status = tk.Label(row2, text="", bg=pal["panel_alt"],
                                fg=pal["faint"], font=self.fonts.tiny())
         self.status.pack(side="left", padx=(12, 0))
         cols = [("idx", "#", 34, "c"), ("name", "名称", 118, "w"),
@@ -2031,7 +2492,9 @@ class SelectWindow(BaseDialog):
             self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
         self.tree.pack(fill="both", expand=True, padx=8, pady=4)
         self.tree.bind("<Double-Button-1>", self._add)
-        tk.Label(card, text="命中策略越多越可靠; 数据每 30 分钟缓存",
+        self.empty_hint = _tree_hint(self.tree, "点击「开始选股」，扫描全市场",
+                                     pal, self.fonts)
+        tk.Label(card, text="命中策略越多越可靠；数据每 30 分钟缓存",
                  bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(0, 8))
         self._busy = False
@@ -2052,6 +2515,8 @@ class SelectWindow(BaseDialog):
         self.app.save_config()
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self.empty_hint.config(text="选股中…")
+        _hint_show(self.empty_hint, True)
         self._busy = True
         self.status.config(text="选股中… 0/%d" % depth)
 
@@ -2090,9 +2555,13 @@ class SelectWindow(BaseDialog):
         self._busy = False
         if err:
             self.status.config(text="选股失败: %s" % err)
+            self.empty_hint.config(text="选股失败")
+            _hint_show(self.empty_hint, True)
             return
         if not rows:
             self.status.config(text="无命中(可加大筛选深度或勾选更多策略)")
+            self.empty_hint.config(text="无命中结果")
+            _hint_show(self.empty_hint, True)
             return
         for i, r in enumerate(rows, 1):
             self.tree.insert("", "end", iid=r["code"], values=(
@@ -2100,6 +2569,7 @@ class SelectWindow(BaseDialog):
                 D.fmt_price(r["price"], 2), D.fmt_pct(r["pct"]),
                 D.fmt_yi_wan(r["amount"]), len(r.get("hits") or {}),
                 r.get("reasons", "")))
+        _hint_show(self.empty_hint, False)
         self.status.config(text="共 %d 只命中(按命中策略数排序)" % len(rows))
 
     def _add(self, _event=None):
@@ -2131,7 +2601,7 @@ class StrengthWindow(BaseDialog):
     def __init__(self, app):
         super().__init__(app, "自选强弱排序", 780, 620)
         setup_ttk(self.win, self.pal, self.fonts, self.S)     # 表格样式跟随主题
-        self.header("自选强弱排序", "按 60 日相对强度(RPS 近似)与竞价评分排序, 数据免费即时")
+        self.header("自选强弱排序", "按 60 日相对强度（RPS 近似）与竞价评分排序")
         pal = self.pal
         foot = tk.Frame(self.body, bg=pal["panel"])
         foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
@@ -2155,7 +2625,8 @@ class StrengthWindow(BaseDialog):
             self.tree.heading(cid, text=label, anchor=anchor)
             self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
-        tk.Label(card, text="RPS 近似 = 该股涨幅 - 沪深300 同期涨幅; 数据每 30 分钟缓存",
+        self.empty_hint = _tree_hint(self.tree, "正在计算…", pal, self.fonts)
+        tk.Label(card, text="RPS 近似 = 该股涨幅 - 沪深300 同期涨幅；数据每 30 分钟缓存",
                  bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(0, 8))
         self.win.after(60, self._load)
@@ -2163,6 +2634,9 @@ class StrengthWindow(BaseDialog):
     def _load(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self.status.config(text="加载中…")
+        self.empty_hint.config(text="正在计算…")
+        _hint_show(self.empty_hint, True)
         app = self.app
         try:
             rows = []
@@ -2182,9 +2656,11 @@ class StrengthWindow(BaseDialog):
                              "、".join((st.get("flags") or [])[:2])))
         except Exception as exc:
             self.status.config(text="加载失败: %s" % str(exc)[:80])
+            self.empty_hint.config(text="加载失败")
             return
         if not rows:
             self.status.config(text="无自选或数据未就绪(需联网; 数据 30 分钟缓存)")
+            self.empty_hint.config(text="暂无数据")
             return
         rows.sort(key=lambda r: (-(r[2] if r[2] is not None else -999),
                                  -(r[4] if r[4] is not None else -999)))
@@ -2194,6 +2670,7 @@ class StrengthWindow(BaseDialog):
                 ("%.1f%%" % a60) if a60 is not None else "-",
                 ("%.1f%%" % a20) if a20 is not None else "-",
                 ("%+d" % score) if score is not None else "-", flags))
+        _hint_show(self.empty_hint, False)
         self.status.config(text="共 %d 只(按 60 日相对强度排序)" % len(rows))
 
 
@@ -2204,7 +2681,7 @@ class ScanWindow(BaseDialog):
     def __init__(self, app):
         super().__init__(app, "当日异动扫描", 780, 640)
         setup_ttk(self.win, self.pal, self.fonts, self.S)     # 表格样式跟随主题
-        self.header("当日异动扫描", "全市场筛选: 涨幅 ≥4% 且成交额 ≥2亿, 按涨幅降序")
+        self.header("当日异动扫描", "全市场筛选：涨幅 ≥4% 且成交额 ≥2 亿，按涨幅降序")
         pal = self.pal
         foot = tk.Frame(self.body, bg=pal["panel"])
         foot.pack(fill="x", side="bottom", padx=18, pady=(2, 10))
@@ -2228,7 +2705,8 @@ class ScanWindow(BaseDialog):
             self.tree.column(cid, width=int(width * self.S), anchor=anchor, stretch=True)
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree.bind("<Double-Button-1>", self._add)
-        tk.Label(card, text="双击一行 = 加入自选; 数据来自全市场实时快照",
+        self.empty_hint = _tree_hint(self.tree, "正在扫描全市场…", pal, self.fonts)
+        tk.Label(card, text="双击一行加入自选；数据为全市场实时快照",
                  bg=pal["panel_alt"], fg=pal["faint"],
                  font=self.fonts.tiny()).pack(anchor="w", padx=12, pady=(0, 8))
         self.win.after(60, self._load)
@@ -2236,19 +2714,25 @@ class ScanWindow(BaseDialog):
     def _load(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self.status.config(text="加载中…")
+        self.empty_hint.config(text="正在扫描全市场…")
+        _hint_show(self.empty_hint, True)
         try:
             rows = D.scan_market(limit=40)
         except Exception as exc:
             self.status.config(text="加载失败: %s" % str(exc)[:80])
+            self.empty_hint.config(text="加载失败")
             return
         if not rows:
             self.status.config(text="无异动股(或接口暂不可用, 请稍后刷新)")
+            self.empty_hint.config(text="暂无数据")
             return
         for i, r in enumerate(rows, 1):
             self.tree.insert("", "end", iid=r["code"], values=(
                 i, r["name"], D.code_digits(r["code"]),
                 D.fmt_price(r["price"], 2), D.fmt_pct(r["pct"]),
                 D.fmt_yi_wan(r["amount"])))
+        _hint_show(self.empty_hint, False)
         self.status.config(text="共 %d 只异动(涨幅≥4%% 且成交额≥2亿)" % len(rows))
 
     def _add(self, _event=None):
@@ -2323,7 +2807,7 @@ class ManageStocksWindow(BaseDialog):
         CanvasButton(search, "搜索", self._search_now, pal, self.fonts, kind="primary",
                      width=66, height=32, scale=self.S, bg=pal["panel_alt"]).pack(
             side="left", padx=8, pady=7)
-        tk.Label(search, text="支持名称 / 代码 / 拼音首字母，如 茅台、510300", bg=pal["panel_alt"],
+        tk.Label(search, text="支持名称、代码、拼音首字母，如 茅台、510300", bg=pal["panel_alt"],
                  fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(2, 12))
 
         lists = tk.Frame(body, bg=pal["panel"])
@@ -2358,7 +2842,7 @@ class ManageStocksWindow(BaseDialog):
                      width=88, height=32, scale=self.S).pack(pady=6)
         CanvasButton(middle, "↓ 下移", lambda: self._move(1), pal, self.fonts,
                      width=88, height=32, scale=self.S).pack(pady=6)
-        tk.Label(middle, text="顺序即\n切换顺序", bg=pal["panel"], fg=pal["faint"],
+        tk.Label(middle, text="列表顺序\n即切换顺序", bg=pal["panel"], fg=pal["faint"],
                  font=self.fonts.tiny(), justify="center").pack(pady=(10, 0))
 
         right = tk.Frame(lists, bg=pal["panel_alt"], highlightbackground=pal["border"],
@@ -2561,7 +3045,7 @@ class HoldingsWindow(BaseDialog):
         self._lay = lay if isinstance(lay, dict) else {}
         super().__init__(app, "持仓设置 · 模拟盘", 880, 816)
         self.header("持仓设置 · 模拟盘",
-                    "买入填成本价、卖出填卖价, 费用按费率规则自动估算, 历史盈亏自动累计")
+                    "买入、卖出填成交价，费用按费率自动估算，盈亏自动累计")
         self.selected = None
         self.holdings = {c: {"trades": list(h.get("trades") or [])}
                          for c, h in (app.cfg.get("holdings") or {}).items()
@@ -2577,6 +3061,25 @@ class HoldingsWindow(BaseDialog):
         self._tick()
 
     # ---------- 构建 ----------
+    def _tree_hint(self, tree, text):
+        """空表格占位提示: 叠在表格中心, 有数据时隐藏。"""
+        lab = tk.Label(tree, text=text, bg=self.pal["panel_soft"],
+                       fg=self.pal["faint"], font=self.fonts.label())
+        lab.place(relx=0.5, rely=0.55, anchor="center")
+        lab.lift()
+        return lab
+
+    @staticmethod
+    def _hint_show(lab, show):
+        try:
+            if show:
+                lab.place(relx=0.5, rely=0.55, anchor="center")
+                lab.lift()
+            else:
+                lab.place_forget()
+        except tk.TclError:
+            pass
+
     def _card(self, parent, title):
         pal = self.pal
         card = tk.Frame(parent, bg=pal["panel_alt"], highlightbackground=pal["border"],
@@ -2620,6 +3123,7 @@ class HoldingsWindow(BaseDialog):
             self.tree.tag_configure(tag, foreground=col)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.top_hint = self._tree_hint(self.tree, "暂无持仓，下方交易后自动记录")
         # 分割把手: 上下拖动改变持仓明细高度, 下方组件随之移动(有最小值)
         SizeHandle(body, lambda dx, dy: self._drag_list("top", dy), pal, S, "ns",
                    thick=int(7 * S), on_release=self._save_layout).pack(fill="x", pady=(3, 3))
@@ -2632,7 +3136,7 @@ class HoldingsWindow(BaseDialog):
 
         head = tk.Frame(trade, bg=pal["panel_alt"])
         head.pack(fill="x", padx=14, pady=(10, 2))
-        self.sel_label = tk.Label(head, text="在上方选择一只股票后交易", bg=pal["panel_alt"],
+        self.sel_label = tk.Label(head, text="在上方选中一只股票后交易", bg=pal["panel_alt"],
                                   fg=pal["text_dim"], font=self.fonts.label())
         self.sel_label.pack(side="left")
         self.hint_label = tk.Label(head, text="", bg=pal["panel_alt"], fg=pal["faint"],
@@ -2641,15 +3145,18 @@ class HoldingsWindow(BaseDialog):
 
         form = tk.Frame(trade, bg=pal["panel_alt"])
         form.pack(fill="x", padx=14, pady=(4, 2))
-        for i in range(4):
-            form.columnconfigure(i, weight=1, uniform="form")   # 四列等宽, 窗口越宽输入框越长
+        for i in range(3):
+            form.columnconfigure(i, weight=1, uniform="form")   # 三列等宽, 输入框占满整行
 
         def field(col, label, numeric=True):
             box = tk.Frame(form, bg=pal["panel_alt"])
             box.grid(row=0, column=col, sticky="ew",
-                     padx=(0, 18 if col < 3 else 0))
-            tk.Label(box, text=label, bg=pal["panel_alt"], fg=pal["muted"],
-                     font=self.fonts.label()).pack(side="left", padx=(0, 10))
+                     padx=(0, 18 if col < 2 else 0))
+            holder = tk.Frame(box, bg=pal["panel_alt"], width=int(58 * S))
+            holder.pack(side="left", fill="y")
+            holder.pack_propagate(False)
+            tk.Label(holder, text=label, bg=pal["panel_alt"], fg=pal["muted"],
+                     font=self.fonts.label(), anchor="w").pack(side="left")
             var = tk.StringVar()
             ent = make_entry(box, pal, self.fonts, width=10, textvariable=var,
                              numeric=numeric)
@@ -2700,6 +3207,7 @@ class HoldingsWindow(BaseDialog):
                      width=104, height=32, scale=S,
                      bg=pal["panel_alt"]).pack(anchor="w")
         self.log_tree.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.log_hint = self._tree_hint(self.log_tree, "暂无成交记录")
         # 分割把手: 下拉变高成交记录, 下方汇总下移(有最小值)
         SizeHandle(body, lambda dx, dy: self._drag_list("log", dy), pal, S, "ns",
                    thick=int(7 * S), on_release=self._save_layout).pack(fill="x", pady=(3, 3))
@@ -2828,7 +3336,7 @@ class HoldingsWindow(BaseDialog):
         for w in (self.price_entry, self.lots_entry, self.note_entry):
             w.config(state=state)
         if not enabled:
-            self.sel_label.config(text="在上方选择一只股票后交易")
+            self.sel_label.config(text="在上方选中一只股票后交易")
             self.hint_label.config(text="")
 
     # ---------- 表格 ----------
@@ -2869,6 +3377,7 @@ class HoldingsWindow(BaseDialog):
             self.tree.insert("", "end", iid=code, values=values, tags=(tag,))
         if selected and self.tree.exists(selected):
             self.tree.selection_set(selected)
+        self._hint_show(self.top_hint, not self.tree.get_children())
         self._refresh_log()
         self._update_totals()
 
@@ -2911,6 +3420,7 @@ class HoldingsWindow(BaseDialog):
             else:
                 tag = "up" if pnl > 0 else ("down" if pnl < 0 else "flat")
             tree.insert("", "end", iid=f"{code}#{i}", values=values, tags=(tag,))
+        self._hint_show(self.log_hint, not tree.get_children())
 
     def _update_totals(self):
         pal = self.pal
@@ -2928,7 +3438,9 @@ class HoldingsWindow(BaseDialog):
                                 ("real", real, D.change_color(real, pal)),
                                 ("fl", fl, D.change_color(fl, pal)),
                                 ("total", total, D.change_color(total, pal))):
-            self.stat_vars[key].config(text=D.fmt_money_signed(val), fg=color)
+            # 买入/卖出是累计金额, 不带正号; 盈亏才带 +/-
+            text = D.fmt_money(val) if key in ("buy", "sell") else D.fmt_money_signed(val)
+            self.stat_vars[key].config(text=text, fg=color)
 
     # ---------- 交易 ----------
     def _on_select(self, _event=None):
