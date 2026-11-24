@@ -202,6 +202,14 @@ python stock_bar.py --version
 
 > 截图均为**虚构演示数据**，不含任何真实持仓信息。
 
+### 📈 个股详情窗 · AI 研判
+
+| 个股详情窗（分时 / K 线 / 盘口 / 板块 / 狙击点位 / AI） | AI 研判（评分 · 推荐 · 理由 · 风险 · 观察计划） |
+|---|---|
+| ![个股详情](screenshots/preview_detail.png) | ![AI 研判](screenshots/preview_ai.png) |
+
+### 🩵 悬浮胶囊 · 持仓
+
 | 悬浮卡片 | 持仓总览 |
 |---|---|
 | ![卡片](screenshots/preview_card.png) | ![持仓](screenshots/preview_holdings_card.png) |
