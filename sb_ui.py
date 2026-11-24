@@ -117,10 +117,13 @@ class InfoCard:
         except tk.TclError:
             pass
         self.canvas = tk.Canvas(self.win, bg=KEY_COLOR, highlightthickness=0, bd=0)
-        self.canvas.bind("<Button-1>", self._on_card_click)   # AI 研判按钮
+        self.canvas.bind("<Button-1>", self._on_card_click)   # AI 按钮 / 分时图 / 持仓卡
+        self.canvas.bind("<Motion>", self._on_card_motion)
         self.canvas.pack()
         self.code = None
         self.kind = "stock"          # stock=个股/指数详情卡 | holdings=持仓总览卡
+        self._chart_hit = None       # 分时图命中矩形: 点击打开大窗口
+        self._ai_btn = None
         self._ai_cache = {}          # {code: AI研判文字} —— 按股票分开, 防串号
         self._ai_busy = set()        # 正在研判的 code 集合
         self.series = None
@@ -382,6 +385,31 @@ class InfoCard:
         if rect and rect[0] <= event.x <= rect[2] and rect[1] <= event.y <= rect[3]:
             self._ask_ai()
             return "break"
+        if self.kind == "holdings":
+            self.app.open_holdings()
+            return "break"
+        hit = getattr(self, "_chart_hit", None)
+        if self.kind == "stock" and hit and (
+                hit[0] <= event.x <= hit[2] and hit[1] <= event.y <= hit[3]):
+            code = self.code
+            if code:
+                self.hide()
+                self.app.open_stock_detail(code)
+            return "break"
+
+    def _on_card_motion(self, event):
+        """分时图/持仓卡显示手型光标; 其余区域保持默认。"""
+        hand = False
+        if self.kind == "holdings":
+            hand = True
+        else:
+            hit = getattr(self, "_chart_hit", None)
+            hand = bool(hit and hit[0] <= event.x <= hit[2]
+                        and hit[1] <= event.y <= hit[3])
+        try:
+            self.canvas.configure(cursor="hand2" if hand else "")
+        except tk.TclError:
+            pass
 
     def _ask_ai(self):
         """点击「AI 研判」: 后台线程调用大模型, 结果回到卡片展示(按股票分存)。"""
@@ -696,6 +724,8 @@ class InfoCard:
 
     # ---------- 绘制 ----------
     def _render(self):
+        self._chart_hit = None
+        self._ai_btn = None
         if self.kind == "holdings":
             self._render_holdings()
             return
@@ -760,6 +790,8 @@ class InfoCard:
         # 分时图(简洁模式不显示)
         if not p["simple"]:
             self._draw_chart(c, p, q, color, soft)
+            self._chart_hit = (pad, p["chart"] - int(4 * S),
+                               w - pad, p["chart"] + int(68 * S))
             phase = auction_phase()
             if phase == "auction":
                 # 竞价进行中: 右端是实时时间(而不是固定的 09:25)
@@ -1143,6 +1175,10 @@ class BaseDialog:
         focus_window(self.win)      # OS 层焦点, 输入框/快捷键才可用
         if self.key:
             app._dialogs[self.key] = self
+
+    def on_app_settings(self):
+        """外观设置变更后的统一入口；子类可覆盖并重绘自定义画布。"""
+        self.pal = self.app.pal
 
     # ---- 窗口缩放: 由系统原生边框处理, 这里只做回调分发 ----
     def set_resize_handler(self, on_resize=None, on_release=None):
@@ -2004,6 +2040,7 @@ class HelpWindow(BaseDialog):
         self._build_cards(body)
         self._build_tools(body)
         self._build_data(body)
+        self._build_detail(body)
         self._build_shortcuts(body)
         self._build_faq(body)
         self.win.bind("<MouseWheel>", self._on_mousewheel)
@@ -2198,7 +2235,8 @@ class HelpWindow(BaseDialog):
                            "拖到任务栏会自动吸附。")
         self._step(sec, 2, "行情条分三段：左边是当前自选股，中间是持仓当日盈亏，"
                            "右边是自选指数。没有持仓时中间段自动隐藏。")
-        self._step(sec, 3, "鼠标悬停分区看详情；单击左边个股段切换下一只；右键打开功能菜单。")
+        self._step(sec, 3, "鼠标悬停分区看详情；单击左边个股段切换下一只；"
+                           "在详情卡的分时图上左键单击可打开详细大窗口；右键打开功能菜单。")
         self._p(sec, "建议第一次使用按这个顺序设置：外观与字号 → 管理自选股 → 持仓设置 → "
                      "需要时再配置 AI 研判。", color=self.pal["muted"], pady=(6, 0))
 
@@ -2311,7 +2349,8 @@ class HelpWindow(BaseDialog):
         self._sub(sec, "竞价评分")
         self._bullet(sec, "5 项可解释评分：高开幅度、撮合趋势、买卖力量、量价配合、价格稳定。")
         self._bullet(sec, "顶部徽章给出偏多 / 中性 / 偏空；红色偏多、绿色偏空，跟随涨跌配色设置。")
-        self._bullet(sec, "评分是规则计算，不依赖大模型；没有配置 AI 也能使用。")
+        self._bullet(sec, "规则评分 = 五项得分直接相加，不依赖大模型；没有配置 AI 也能使用。"
+                          "训练权重只作模型参考，不覆盖规则总分。")
         self._sub(sec, "AI 研判")
         self._bullet(sec, "在设置里填服务商、接口、模型、API Key；开启“自动研判”后 9:25 自动跑一次。")
         self._bullet(sec, "也可在竞价卡上点「AI 研判」，或悬停时按 T 立即研判当前股票。")
@@ -2346,7 +2385,7 @@ class HelpWindow(BaseDialog):
         self._kv(sec, "config.json", "自选、持仓、外观、AI、手续费等全部设置；首次运行自动生成。")
         self._kv(sec, "config.json.bak", "配置损坏时的自动备份；可用它恢复。")
         self._kv(sec, "stock_bar.log", "运行日志；行情异常、窗口报错时先看这里。")
-        self._kv(sec, "auction_data\\", "每日竞价存档与 weights.json（评分权重），用于复盘和自动训练。")
+        self._kv(sec, "auction_data\\", "每日竞价存档与 weights.json（模型参考权重，不覆盖规则总分）；用于复盘和自动训练。")
         self._kv(sec, "update_cache.json", "更新检查缓存；删除后会重新检查。")
         self._kv(sec, "stock_bar.lock", "单实例锁；程序运行期间存在，退出后自动删除。")
         self._sub(sec, "手动改配置")
@@ -2355,9 +2394,94 @@ class HelpWindow(BaseDialog):
                 color=self.pal["muted"])
         self._p(sec, "整个文件夹可直接复制到另一台电脑，配置与持仓一起带走。", color=self.pal["muted"])
 
-    # ---- 10 快捷键 ----
+    # ---- 10 详细窗口 ----
+    def _build_detail(self, parent):
+        sec = self._card(parent, "10", "股票详细大窗口")
+        self._p(sec, "左侧分时图左键单击，或按 Enter，即可打开大窗口。窗口为单例："
+                     "重复打开会复用同一个窗口并切换到新股票，不会叠出一堆窗口。")
+        self._sub(sec, "三个入口")
+        self._bullet(sec, "个股卡：悬停自选段后，左键单击卡片里的分时图；或按 Enter。")
+        self._bullet(sec, "指数卡：左键单击指数分时图；或鼠标停在指数段按 Enter。")
+        self._bullet(sec, "持仓卡：左键单击整张持仓总览卡，进入「持仓设置」；"
+                          "持仓卡不打开分时大窗口。")
+        self._sub(sec, "1.8.1 修复")
+        self._bullet(sec, "详细窗口的涨跌颜色会跟随「红涨绿跌 / 绿涨红跌」设置即时重绘；"
+                          "切换深浅主题时详细窗口也会自动重建，不再沿用旧配色。")
+        self._bullet(sec, "港股/美股行情时间格式已兼容，涨跌幅不再恒为 0%；"
+                          "A 股开盘前的昨日行情仍按 0% 处理。")
+        self._sub(sec, "窗口结构（1.8.0）")
+        self._bullet(sec, "左栏：全高自选股列表，与右侧图表分开；顶部搜索框宽度跟随左栏，"
+                          "下面列表独立滚动。搜索支持代码/名称/拼音；点结果切股，"
+                          "点 + 加入自选，已在自选显示 ✓。")
+        self._bullet(sec, "分隔线：左栏和右侧之间的竖线可左右拖动调宽（约 180–360），"
+                          "双击恢复默认；宽度会自动记住。")
+        self._bullet(sec, "右栏顶部：名称、代码、市场、现价与涨跌；右侧八格为今开/最高/最低/昨收、"
+                          "成交量/额/换手/量比（指数为成交量/额/振幅/时间）。")
+        self._bullet(sec, "右栏下方整页纵向滚动，顺序为「图表 + 五档/逐笔」→「周期/指标」→"
+                          "「板块 / 概念」→「狙击点位」→「AI 研判」。"
+                          "五档/逐笔与 K 线严格等高；指数没有五档与逐笔，右栏自动隐藏，"
+                          "图表占满右栏，板块/点位也隐藏。")
+        self._bullet(sec, "周期：分时 / 5日 / 日K / 周K / 月K；指标：量 / MACD / KDJ。"
+                          "周期和指标不再固定底部，会随整页一起上下滚动。")
+        self._sub(sec, "滚轮规则（互不打扰）")
+        self._bullet(sec, "图表内滚轮：仍是缩放横轴；分时 30–240 分钟，K 线 15 根到全部。")
+        self._bullet(sec, "五档/逐笔内滚轮：仍是逐笔翻页；左栏内滚轮：滚动自选列表；"
+                          "搜索框内滚轮不劫持。")
+        self._bullet(sec, "右侧滚动条、周期/指标行、板块/点位等中立位置滚轮：整页上下滚动，"
+                          "用来翻到下方 AI。点周期行右侧「AI ↓」可直接滚到 AI；"
+                          "AI 标题旁「↑ 回到图表」回到顶部。")
+        self._sub(sec, "板块 / 概念（1.8.0）")
+        self._bullet(sec, "数据来自东方财富个股所属板块接口；按「行业 → 地域 → 概念」排序，"
+                          "普通模式下最多显示行业 2 个、地域 1 个、概念 6 个，其余用总数提示。")
+        self._bullet(sec, "标签带当日板块涨幅；红涨绿跌跟随主题。指数/风格/资金属性标签"
+                          "（沪深300、上证50、融资融券、基金重仓、大盘/中盘/小盘等）会被过滤。")
+        self._bullet(sec, "按股票代码缓存 30 分钟；网络失败静默降级为空标签，不影响行情和 AI。")
+        self._sub(sec, "狙击点位（1.8.0）")
+        self._bullet(sec, "点位由程序按 180 根前复权日线计算，AI 不自由报价；"
+                          "AI 只能从带编号的候选里选，价格不能新增或改写。")
+        self._bullet(sec, "理想买入：现价下方最近的支撑区（MA5/MA10/MA20/MA60、"
+                          "近 20/60 日低点、前平台高点、0.382/0.5/0.618 回撤）。")
+        self._bullet(sec, "二次买入：理想区下方的下一档支撑；没有合适下一档时显示“—”，不硬凑；"
+                          "止损放在二次支撑下方 0.3–0.5 ATR，并参考 MA60/近低点与 6% 最大风险位；"
+                          "止盈用近 20/60 日高点、前平台高点或 1.618 扩展。")
+        self._bullet(sec, "AI 选点后由程序复核：二次买入必须低于理想买入、止损必须低于二次买入、"
+                          "止盈必须高于理想买入、风报比不足 1.5 或编号不存在时自动回退规则默认，"
+                          "右上角标「AI 选择 / 规则回退」。")
+        self._bullet(sec, "点位状态随 2 秒行情刷新：等待回踩、已进入区间、距止损、距止盈、计划失效；"
+                          "只做辅助参考，不构成投资建议。")
+        self._sub(sec, "AI 研判（详细窗口内）")
+        self._bullet(sec, "分模块：01 评分（0–100 + 区间）、02 推荐（动作 + 结论）、03 建议/理由、"
+                          "04 风险、05 观察计划（触发/失效/下次检查）、06 数据质量 + 免责声明。")
+        self._bullet(sec, "阶段按本地时钟判断：盘前 / 竞价 / 撮合 / 开盘 / 早盘 / 午间 / 盘中 / 尾盘 / 盘后 / 休市；"
+                          "Prompt 会带上当前阶段、持仓、行情/分时/K线/竞价和 MCP 摘要。")
+        self._bullet(sec, "评分口径：80–100 强烈买入、60–79 买入、40–59 观望、20–39 减仓、0–19 卖出；"
+                          "动作支持买入/加仓/持有/减仓/卖出/观望/回避/预警。评分与动作冲突时显示「口径待复核」。")
+        self._bullet(sec, "数据质量由程序本地计算：行情延迟/非今日、分时/竞价日期、基本面摘要缺失、"
+                          "五档/逐笔缺失、指数无盘口等；不让模型编造数据。")
+        self._bullet(sec, "启用狙击点位后，Prompt 追加规则候选编号；AI 只能返回 I/S/L/T 编号，"
+                          "不能写价格。程序负责复核，失败自动回退规则默认。")
+        self._bullet(sec, "第一次滚动到 AI 且当前阶段无缓存时自动研判；按代码+日期+阶段缓存；"
+                          "右上角「重新研判」可强制刷新。未启用或没填 API Key 时只显示设置入口，不请求接口。")
+        self._sub(sec, "鼠标操作")
+        self._bullet(sec, "拖动：按住左键左右拖动平移；双击复位到全览。")
+        self._bullet(sec, "单击：锁定十字光标，再单击解锁；竖线联动主图、成交量与指标区。")
+        self._bullet(sec, "点右侧五档价格：在主图画一条黄色价位线，再点同一价格取消。")
+        self._bullet(sec, "成交明细：滚轮上下翻；翻到最早一页会继续加载更早的逐笔。")
+        self._sub(sec, "刷新与数据")
+        self._bullet(sec, "行情 2 秒、分时 30 秒、逐笔 2 秒、K 线 60 秒；窗口不可见时暂停，"
+                          "不会在后台空跑。")
+        self._bullet(sec, "5日分时没有稳定的公开接口，程序从首次使用起按日本地累积；"
+                          "首日只显示 1 天，之后逐日补到 5 天。")
+        self._bullet(sec, "逐笔来自腾讯最近成交分页，不是 Level-2；免费接口可能有延迟。")
+        self._sub(sec, "窗口")
+        self._bullet(sec, "位置、大小与左栏宽度自动记忆；右上角「置顶」可切换是否总在最前；Esc 关闭。")
+        self._p(sec, "K 线中的 MA5/MA10/MA20 颜色与图例一致；MACD 的 DIF/DEA、"
+                     "KDJ 的 K/D/J 也在指标区左上角标注。",
+                color=self.pal["muted"], pady=(6, 0))
+
+    # ---- 11 快捷键 ----
     def _build_shortcuts(self, parent):
-        sec = self._card(parent, "10", "快捷键一览")
+        sec = self._card(parent, "11", "快捷键一览")
         for key, value in (
                 ("F1", "打开本使用帮助"),
                 ("Ctrl+Shift+S", "打开设置"),
@@ -2367,16 +2491,17 @@ class HelpWindow(BaseDialog):
                 ("F5", "重新加载 config.json"),
                 ("← / → / ↑ / ↓", "切换上一只 / 下一只自选"),
                 ("1 / 2 / 3", "个股卡 / 持仓总览 / 竞价评分卡"),
+                ("Enter", "打开当前悬停分区的大窗口（个股/指数）或持仓设置"),
                 ("T", "竞价卡 + 立即 AI 研判"),
                 ("Esc", "关闭详情卡或当前窗口"),
         ):
             self._kv(sec, key, value)
-        self._p(sec, "1 / 2 / 3 / T 需要鼠标停在行情条上；Ctrl 系列快捷键需要先让行情条获得焦点"
+        self._p(sec, "1 / 2 / 3 / T / Enter 需要鼠标停在行情条上；Ctrl 系列快捷键需要先让行情条获得焦点"
                      "（单击一下即可）。", color=self.pal["muted"], pady=(6, 0))
 
     # ---- 11 FAQ ----
     def _build_faq(self, parent):
-        sec = self._card(parent, "11", "常见问题")
+        sec = self._card(parent, "12", "常见问题")
         for q, a in (
                 ("行情不刷新 / 收盘后不动",
                  "设置 → 行情 → 请求时段改成「全天请求」；交易时段模式下 16 点后和周末不请求。"),

@@ -9,6 +9,7 @@ import datetime as _dt
 import json
 import os
 import socket
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -21,6 +22,10 @@ SINA_URL = "https://hq.sinajs.cn/list={codes}"
 EAST_URL = ("https://push2.eastmoney.com/api/qt/ulist.np/get"
             "?fltt=2&invt=2&fields={fields}&secids={secids}")
 MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}&_var=min_data"
+KLINE_URL = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+             "?param={code},{period},,,{count},qfq")
+TICK_URL = ("https://stock.gtimg.cn/data/index.php"
+            "?appn=detail&action=data&c={code}&p={page}")
 SEARCH_URL = "https://smartbox.gtimg.cn/s3/?q={kw}&t=all"
 RELEASES_API = "https://api.github.com/repos/gdy4803-maker/stock-bar/releases?per_page=20"
 
@@ -132,6 +137,15 @@ class Quote:
     ask1_vol: float = 0.0  # 卖一量
     buy_rest: float = 0.0  # 买余量(集合竞价: 撮合后未成交的买单)
     sell_rest: float = 0.0 # 卖余量(集合竞价: 撮合后未成交的卖单)
+    bid_prices: list = field(default_factory=list)   # 买一~买五价
+    bid_vols: list = field(default_factory=list)     # 买一~买五量(手)
+    ask_prices: list = field(default_factory=list)   # 卖一~卖五价
+    ask_vols: list = field(default_factory=list)     # 卖一~卖五量(手)
+    turnover: float = 0.0      # 换手率 %
+    amplitude: float = 0.0     # 振幅 %
+    limit_up: float = 0.0      # 涨停价
+    limit_down: float = 0.0    # 跌停价
+    volume_ratio: float = 0.0  # 量比
 
 
 @dataclass(slots=True)
@@ -140,6 +154,30 @@ class MinuteSeries:
     points: list = field(default_factory=list)   # [(HH:MM, price), ...]
     prev_close: float = 0.0
     date: str = ""
+    volumes: list = field(default_factory=list)      # 每分钟成交量(手)
+    amounts: list = field(default_factory=list)      # 每分钟成交额(元)
+    avg_prices: list = field(default_factory=list)   # 每分钟累计均价
+
+
+@dataclass(slots=True)
+class KlineBar:
+    date: str
+    open: float
+    close: float
+    high: float
+    low: float
+    volume: float
+
+
+@dataclass(slots=True)
+class Tick:
+    seq: int
+    time: str
+    price: float
+    change: float
+    volume: float      # 手
+    amount: float      # 元
+    side: str          # B 买 / S 卖 / M 中性
 
 
 @dataclass(slots=True)
@@ -429,15 +467,39 @@ def sold_today(trades, today: str = "") -> bool:
     return False
 
 
+def _quote_date(q) -> str:
+    """从腾讯/新浪的行情时间中提取 YYYYMMDD。
+
+    A 股为 ``20261124140211``，港股/美股则可能是
+    ``2026/11/24 13:47:08`` 或 ``2026-11-23 16:00:01``。
+    """
+    digits = "".join(ch for ch in str(getattr(q, "time", "") or "") if ch.isdigit())
+    return digits[:8] if len(digits) >= 8 else ""
+
+
 def quote_is_today(q, today: str = "") -> bool:
-    """行情是否为当天数据(9 点前接口给的还是昨天的行情)。"""
-    today = (today or _dt.date.today().isoformat()).replace("-", "")
-    return str(getattr(q, "time", ""))[:8] == today
+    """行情是否为当天数据。
+
+    A 股开盘前接口仍返回昨日行情，需按日期归零；港股/美股的 ``time``
+    带日期分隔符，且美股交易日与本地日历可能错位，不能再用
+    ``time[:8]`` 直接比较，否则涨跌幅会被全部判成 0%。
+    """
+    date = _quote_date(q)
+    if not date:
+        return False
+    code = str(getattr(q, "code", "") or "").lower()
+    if code[:2] in ("hk", "us"):
+        # 海外行情以行情源日期为准；只要时间字段可解析就视为有效，
+        # 避免美股盘后/本地日期不同导致涨跌幅恒为 0。
+        return True
+    today = "".join(ch for ch in
+                    (today or _dt.date.today().isoformat()) if ch.isdigit())[:8]
+    return date == today
 
 
 def today_pct(q):
-    """今日涨跌幅(%): 行情不是当天的(9 点前)按 0 计 —— 与今日盈亏口径一致,
-    避免"今日盈亏 0 但涨幅是昨天的"这种不一致。"""
+    """今日涨跌幅(%): A 股行情不是当天的(9 点前)按 0 计 —— 与今日盈亏口径一致,
+    避免"今日盈亏 0 但涨幅是昨天的"这种不一致；港股/美股按行情源涨幅显示。"""
     if q is None:
         return None
     if not quote_is_today(q):
@@ -502,6 +564,19 @@ def _fetch_tencent(codes, index_set, timeout: float) -> dict[str, Quote]:
                 ask1_vol=_to_float(fields[20]) if len(fields) > 20 else 0.0,
                 buy_rest=_to_float(fields[12]) if len(fields) > 22 else 0.0,
                 sell_rest=_to_float(fields[22]) if len(fields) > 22 else 0.0,
+                bid_prices=[_to_float(fields[i]) if len(fields) > i else 0.0
+                            for i in (9, 11, 13, 15, 17)],
+                bid_vols=[_to_float(fields[i]) if len(fields) > i else 0.0
+                          for i in (10, 12, 14, 16, 18)],
+                ask_prices=[_to_float(fields[i]) if len(fields) > i else 0.0
+                            for i in (19, 21, 23, 25, 27)],
+                ask_vols=[_to_float(fields[i]) if len(fields) > i else 0.0
+                          for i in (20, 22, 24, 26, 28)],
+                turnover=_to_float(fields[38]) if len(fields) > 38 else 0.0,
+                amplitude=_to_float(fields[43]) if len(fields) > 43 else 0.0,
+                limit_up=_to_float(fields[47]) if len(fields) > 47 else 0.0,
+                limit_down=_to_float(fields[48]) if len(fields) > 48 else 0.0,
+                volume_ratio=_to_float(fields[49]) if len(fields) > 49 else 0.0,
             )
         except (IndexError, ValueError):
             continue
@@ -683,6 +758,18 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
                 if q.bid1_vol <= 0 and cur.bid1_vol > 0:
                     q.bid1_vol, q.ask1_vol = cur.bid1_vol, cur.ask1_vol
                     q.buy_rest, q.sell_rest = cur.buy_rest, cur.sell_rest
+                # 新浪只有买一/卖一: 五档与换手/振幅等指标沿用腾讯
+                if not q.bid_prices and cur.bid_prices:
+                    q.bid_prices, q.bid_vols = cur.bid_prices, cur.bid_vols
+                    q.ask_prices, q.ask_vols = cur.ask_prices, cur.ask_vols
+                if q.turnover <= 0:
+                    q.turnover = cur.turnover
+                if q.amplitude <= 0:
+                    q.amplitude = cur.amplitude
+                if q.limit_up <= 0:
+                    q.limit_up, q.limit_down = cur.limit_up, cur.limit_down
+                if q.volume_ratio <= 0:
+                    q.volume_ratio = cur.volume_ratio
             merged[code] = q
     return merged
 
@@ -711,6 +798,8 @@ def fetch_minutes(code: str, timeout: float = 4.0) -> MinuteSeries | None:
     inner = node.get("data") or {}
     rows = inner.get("data") or []
     points = []
+    cum_vols = []
+    cum_amts = []
     for row in rows:
         parts = str(row).split()
         if len(parts) < 2:
@@ -723,6 +812,8 @@ def fetch_minutes(code: str, timeout: float = 4.0) -> MinuteSeries | None:
         if len(label) == 4 and label.isdigit():
             label = label[:2] + ":" + label[2:]
         points.append((label, price))
+        cum_vols.append(_to_float(parts[2]) if len(parts) > 2 else 0.0)
+        cum_amts.append(_to_float(parts[3]) if len(parts) > 3 else 0.0)
     prev_close = 0.0
     try:
         qt = node.get("qt", {}).get(code) or []
@@ -732,8 +823,215 @@ def fetch_minutes(code: str, timeout: float = 4.0) -> MinuteSeries | None:
         prev_close = 0.0
     if not points:
         return None
+
+    # 接口给的是"累计成交量/累计成交额", 差分得到每分钟量; 均价用累计额/累计量
+    volumes, amounts = [], []
+    for i, cv in enumerate(cum_vols):
+        prev_cv = cum_vols[i - 1] if i else 0.0
+        volumes.append(max(0.0, cv - prev_cv))
+        prev_amt = cum_amts[i - 1] if i else 0.0
+        amounts.append(max(0.0, cum_amts[i] - prev_amt) if cum_amts else 0.0)
+    avg_prices = []
+    run_pv = run_v = 0.0
+    for i, cv in enumerate(cum_vols):
+        p = points[i][1]
+        v = volumes[i]
+        run_pv += p * v
+        run_v += v
+        vwap = 0.0
+        if cum_amts and cv > 0:
+            vwap = cum_amts[i] / (cv * 100.0)
+        # 指数/异常单位时 vwap 会明显偏离点位, 回落到成交量加权均价
+        if vwap > 0 and p > 0 and 0.4 <= vwap / p <= 2.5:
+            avg_prices.append(vwap)
+        elif run_v > 0:
+            avg_prices.append(run_pv / run_v)
+        else:
+            avg_prices.append(sum(x[1] for x in points[:i + 1]) / (i + 1))
     return MinuteSeries(code=code, points=points, prev_close=prev_close,
-                        date=str(inner.get("date") or ""))
+                        date=str(inner.get("date") or ""),
+                        volumes=volumes, amounts=amounts, avg_prices=avg_prices)
+
+
+# ---------------- K线 ----------------
+def fetch_kline(code: str, period: str = "day", count: int = 320,
+                timeout: float = 6.0) -> list[KlineBar]:
+    """拉取前复权 K 线(日/周/月); 失败返回 []。指数无复权, 自动兼容 day/week/month。"""
+    if not code or period not in ("day", "week", "month"):
+        return []
+    url = KLINE_URL.format(code=code, period=period, count=max(10, int(count)))
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    start = text.find("{")
+    if start < 0:
+        return []
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return []
+    node = (obj.get("data") or {}).get(code)
+    if not isinstance(node, dict):
+        return []
+    rows = node.get("qfq" + period) or node.get(period) or []
+    bars = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        try:
+            d = str(row[0])
+            o, c, h, l = (float(row[1]), float(row[2]),
+                          float(row[3]), float(row[4]))
+            v = float(row[5])
+        except (TypeError, ValueError):
+            continue
+        if min(o, c, h, l) <= 0:
+            continue
+        bars.append(KlineBar(date=d, open=o, close=c, high=h, low=l, volume=v))
+    bars.sort(key=lambda b: b.date)
+    return bars
+
+
+# ---------------- 逐笔成交 ----------------
+def fetch_ticks(code: str, page: int = 0, timeout: float = 4.0) -> list[Tick]:
+    """腾讯逐笔成交分页; p=0 最早, 页码递增向最新。空页返回 []。"""
+    if not code:
+        return []
+    url = TICK_URL.format(code=code, page=max(0, int(page)))
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    start = text.find("[")
+    if start < 0:
+        return []
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return []
+    if not isinstance(obj, list) or len(obj) < 2 or not isinstance(obj[1], str):
+        return []
+    out = []
+    for item in obj[1].split("|"):
+        parts = item.split("/")
+        if len(parts) < 7:
+            continue
+        try:
+            out.append(Tick(
+                seq=int(parts[0]),
+                time=parts[1],
+                price=float(parts[2]),
+                change=float(parts[3]),
+                volume=float(parts[4]),
+                amount=float(parts[5]),
+                side=parts[6].strip().upper()[:1] or "M",
+            ))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def find_last_tick_page(code: str, timeout: float = 4.0,
+                        max_page: int = 256) -> int:
+    """二分/指数探测当日逐笔最后一页(接口不返回总页数)。"""
+    if not code:
+        return 0
+
+    def nonempty(p):
+        try:
+            return bool(fetch_ticks(code, p, timeout=timeout))
+        except Exception:
+            return False
+
+    if not nonempty(0):
+        return 0
+    lo, hi, probe = 0, 1, 1
+    while probe <= max_page and nonempty(probe):
+        lo, probe = probe, probe * 2
+        hi = probe
+    hi = min(hi, max_page)
+    # 最后一个非空页在 [lo, hi)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if nonempty(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+# ---------------- 分时历史(5日分时用) ----------------
+_HIST_SAVED: dict[tuple[str, str], float] = {}
+
+
+def _history_path(base_dir: str, code: str) -> str:
+    safe = "".join(ch for ch in code if ch.isalnum() or ch in "._-") or "unknown"
+    return os.path.join(base_dir, "minute_history", safe + ".json")
+
+
+def save_minute_history(series: MinuteSeries | None, base_dir: str,
+                        min_interval: float = 300.0) -> None:
+    """把当日分时存档, 供 5 日分时拼接; 同一只股票每 5 分钟最多写一次。"""
+    if not series or not series.points or not series.date or not base_dir:
+        return
+    key = (series.code, str(series.date))
+    now = time.time()
+    if now - _HIST_SAVED.get(key, 0.0) < min_interval:
+        return
+    path = _history_path(base_dir, series.code)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        days = data.get("days") if isinstance(data.get("days"), dict) else {}
+        days[str(series.date)] = {
+            "prev_close": series.prev_close,
+            "points": [[t, p] for t, p in series.points],
+            "volumes": series.volumes,
+            "amounts": series.amounts,
+            "avg_prices": series.avg_prices,
+        }
+        data = {"code": series.code, "days": days}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+        _HIST_SAVED[key] = now
+    except OSError:
+        pass
+
+
+def load_minute_history(code: str, base_dir: str,
+                        days: int = 5) -> list[MinuteSeries]:
+    """读取最近 N 个交易日的分时存档(升序)。"""
+    if not code or not base_dir:
+        return []
+    path = _history_path(base_dir, code)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    raw_days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    out = []
+    for date in sorted(raw_days)[-max(1, int(days)):]:
+        d = raw_days.get(date) or {}
+        points = [(str(p[0]), float(p[1])) for p in (d.get("points") or [])
+                  if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if not points:
+            continue
+        out.append(MinuteSeries(
+            code=code,
+            points=points,
+            prev_close=float(d.get("prev_close") or 0.0),
+            date=str(date),
+            volumes=[float(x) for x in (d.get("volumes") or [])],
+            amounts=[float(x) for x in (d.get("amounts") or [])],
+            avg_prices=[float(x) for x in (d.get("avg_prices") or [])],
+        ))
+    return out
 
 
 # ---------------- 搜索 ----------------
@@ -849,7 +1147,8 @@ def auction_score(samples, prev_close: float, weights=None):
 
     samples: [(时间戳, 虚拟撮合价, 虚拟撮合量, 买余量, 卖余量), ...]
     weights: 可选 [w1..w5, b] —— 用历史数据训练出的权重(逻辑回归);
-    不传则用内置启发式权重。每项 -2 ~ +2 并附依据文字, 评分透明可核对。
+    规则总分 total 始终为五项得分之和; 传入 weights 时只额外返回 model_total/model_prob
+    作为模型参考, 不覆盖规则总分。每项 -2 ~ +2 并附依据文字, 评分透明可核对。
     """
     if not samples or prev_close <= 0:
         return None
@@ -946,14 +1245,17 @@ def auction_score(samples, prev_close: float, weights=None):
     items.append(("价格稳定", s5, d5))
 
     scores = [x[1] for x in items]
+    # 规则评分必须始终等于五项得分之和, 保证界面总分与明细可核对。
+    # 训练权重只额外给出 model_total / model_prob 作为模型参考, 不覆盖规则总分。
+    rule_total = max(-10, min(10, sum(scores)))
+    model_total = None
+    model_prob = None
     if weights and len(weights) >= 6:
-        # 训练权重(逻辑回归): total = Σ w_i * score_i + b, 映射到 -10..+10
         z = sum(w * s for w, s in zip(weights[:5], scores)) + weights[5]
         prob = 1.0 / (1.0 + __import__("math").exp(-max(-30.0, min(30.0, z))))
-        total = int(round((prob - 0.5) * 20))
-    else:
-        total = sum(scores)                     # 内置启发式: 各项直接相加
-    total = max(-10, min(10, total))
+        model_prob = prob
+        model_total = max(-10, min(10, int(round((prob - 0.5) * 20))))
+    total = rule_total
     if total >= 4:
         verdict, tone = "偏多：可买入/持有", "pos"
     elif total <= -4:
@@ -961,7 +1263,9 @@ def auction_score(samples, prev_close: float, weights=None):
     else:
         verdict, tone = "中性：观望为宜", "flat"
     return {"total": total, "items": items, "verdict": verdict, "tone": tone,
-            "gap": gap, "buy_ratio": (buy / (buy + sell)) if (buy + sell) > 0 else 0.5}
+            "gap": gap, "buy_ratio": (buy / (buy + sell)) if (buy + sell) > 0 else 0.5,
+            "rule_total": rule_total, "model_total": model_total,
+            "model_prob": model_prob}
 
 
 def train_logistic(rows, lr: float = 0.25, epochs: int = 400):
@@ -1338,7 +1642,7 @@ def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 60.0):
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
     body = json.dumps({"model": model, "messages": msgs,
-                       "temperature": 0.4, "max_tokens": 1600}).encode("utf-8")
+                       "temperature": 0.4, "max_tokens": 2000}).encode("utf-8")
     try:
         req = urllib.request.Request(base, data=body, method="POST")
         req.add_header("Authorization", "Bearer " + key)
