@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover - 仅 Windows
     winreg = None
 
 import sb_data as D
+import sb_detail
 import sb_ui
 from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
                       enable_dpi_awareness, focus_window, force_topmost,
@@ -49,7 +50,7 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
 from sb_widgets import MenuPopup
 
 APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.8.1"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -574,6 +575,7 @@ class StockBar:
         self.pick_codes: list[str] = []
         self.pick_index = 0
         self.index_code = ""
+        self._detail_names: dict[str, str] = {}
         self.pal = palette(self.cfg["theme"], self.cfg["cn_colors"])
         self._dialogs: dict[str, object] = {}
         self._q: queue.Queue = queue.Queue()
@@ -694,6 +696,7 @@ class StockBar:
         self.input.bind("<Control-c>", lambda e: self.copy_quotes())
         self.input.bind("<F5>", lambda e: self.reload_config())
         self.input.bind("<F1>", lambda e: self.open_help())
+        self.input.bind("<Return>", lambda e: self.open_detail_hover())
 
         self._load_lists()
         self._load_auction_cache()     # 载入今日竞价存档(重启后评分卡立即可用)
@@ -1201,16 +1204,18 @@ class StockBar:
                 return
             px, py = self.root.winfo_pointerxy()
             x, y, w, h = self.bar_rect()
-            inside = x <= px <= x + w and y <= py <= y + h
-            # 鼠标在卡片上也算"未离开"(否则无法点击卡片里的按钮)
-            if not inside and self._card and self._card.visible:
+            on_bar = x <= px <= x + w and y <= py <= y + h
+            # 鼠标在卡片上也算"未离开"(否则无法点击卡片里的按钮),
+            # 但分区切换只在行情条上生效: 鼠标在卡片上左右移动不应切换卡片内容
+            on_card = False
+            if not on_bar and self._card and self._card.visible:
                 try:
                     cx, cy = self._card.win.winfo_rootx(), self._card.win.winfo_rooty()
                     if cx <= px <= cx + self._card.w and cy <= py <= cy + self._card.h:
-                        inside = True
+                        on_card = True
                 except tk.TclError:
                     pass
-            if inside:
+            if on_bar:
                 rel = px - x
                 if rel >= (self._index_zone_left or w):
                     zone = "index"
@@ -1227,6 +1232,11 @@ class StockBar:
                     self._hover_zone = zone
                     if self._card and self._card.visible:
                         self._show_card()
+            elif on_card:
+                # 仅维持悬停状态(卡片不消失), 保持当前分区与卡片内容不变
+                if not self._hovering:
+                    self._hovering = True
+                    self._render_bar(force=True)
             else:
                 if self._hovering:
                     self._hovering = False
@@ -1605,11 +1615,30 @@ class StockBar:
         except Exception:
             pass
 
+    def _read_score_weights(self, path: str):
+        """只接受明确优于启发式基线的权重；劣化模型继续用五项规则总分。"""
+        try:
+            if not os.path.exists(path):
+                return None
+            d = json.load(open(path, "r", encoding="utf-8"))
+            wt = d.get("weights")
+            acc = float(d.get("accuracy") or 0)
+            base = float(d.get("baseline_accuracy") or 0)
+            if wt and len(wt) >= 6 and acc > base:
+                return [float(x) for x in wt]
+            if wt:
+                self._log("忽略评分权重: 模型 %.1f%% 不高于规则基线 %.1f%%, 继续用五项总分"
+                          % (acc * 100, base * 100))
+        except Exception as exc:
+            self._log("读取评分权重失败: %s" % repr(exc)[:100])
+        return None
+
     def _maybe_train_weights(self):
         """攒够样本后自动训练评分权重(纯 Python 逻辑回归, 不依赖第三方库)。
 
         触发: 启动时; 新增可用样本 >= 30 且距上次训练 >= 1 天。
-        结果存 auction_data\\weights.json; 样本不足/失败则继续用内置启发式权重。
+        结果存 auction_data\\weights.json; 只有验证准确率高于启发式基线才启用，
+        否则规则评分继续使用五项直接相加，避免总分与明细不一致。
         """
         try:
             folder = self._auction_dir()
@@ -1637,25 +1666,26 @@ class StockBar:
                     rows.append((feats, label))
             # 上次训练时间控制(避免每次启动都训)
             last = 0.0
+            existing = self._read_score_weights(wpath) if os.path.exists(wpath) else None
+            self._score_weights = existing
             if os.path.exists(wpath):
                 try:
                     last = float(json.load(open(wpath, "r", encoding="utf-8")).get("trained_at") or 0)
                 except Exception:
                     last = 0.0
             if len(rows) < 60 or (time.time() - last) < 86400:
-                if os.path.exists(wpath):
-                    try:
-                        wt = json.load(open(wpath, "r", encoding="utf-8")).get("weights")
-                        if wt and len(wt) >= 6:
-                            self._score_weights = [float(x) for x in wt]
-                    except Exception:
-                        pass
                 return
             weights = D.train_logistic(rows)
             if not weights:
+                self._score_weights = existing
                 return
             old_acc = D.model_accuracy(rows, None)
             new_acc = D.model_accuracy(rows, weights)
+            if new_acc <= old_acc:
+                self._log("评分权重未启用: %d 样本, 模型准确率 %.1f%% 不高于规则基线 %.1f%%"
+                          % (len(rows), new_acc * 100, old_acc * 100))
+                self._score_weights = existing
+                return
             with open(wpath, "w", encoding="utf-8") as f:
                 json.dump({"weights": weights, "samples": len(rows),
                            "accuracy": round(new_acc, 4),
@@ -1742,6 +1772,11 @@ class StockBar:
     def _on_minutes(self, code: str, series):
         self._minute_cache[code] = (time.time(), series)
         self._minute_pending.discard(code)
+        if series:
+            try:
+                D.save_minute_history(series, self.base_dir)
+            except Exception:
+                pass
         for cb in self._minute_waiters.pop(code, []):
             try:
                 cb(code, series)
@@ -1828,6 +1863,12 @@ class StockBar:
             pass
         self._load_lists()
         self._bar_sig = None
+        # 设置变更后让已打开的自定义窗口刷新 palette(尤其是红涨绿跌切换)
+        for dlg in list((getattr(self, "_dialogs", {}) or {}).values()):
+            try:
+                dlg.on_app_settings()
+            except Exception:
+                pass
         # 透明度/文字色键由 _render_bar 按需设置, 并在必要时恢复层级
         self._render_bar(force=True)
         self._restart_worker()
@@ -1849,6 +1890,26 @@ class StockBar:
         self.cfg["stocks"] = codes
         self.save_config()
         self.apply_settings()
+
+    def add_pick(self, code: str | None) -> bool:
+        """把一只股票加入自选; 已存在返回 False, 自选满 40 只也不再加。"""
+        code = D.normalize_code(code or "")
+        if not code:
+            return False
+        if code in (self.cfg.get("stocks") or []):
+            return False
+        if len(self.cfg.get("stocks") or []) >= 40:
+            return False
+        self.cfg.setdefault("stocks", []).append(code)
+        self.save_config()
+        self._load_lists()
+        self._restart_worker(force=True)
+        try:
+            self._render_bar(force=True)
+        except Exception:
+            pass
+        self._log("已加入自选: %s" % code)
+        return True
 
     def refresh_pnl(self):
         self._render_bar(force=True)
@@ -1912,6 +1973,37 @@ class StockBar:
 
     def open_help(self):
         self._open_dialog("help", lambda: sb_ui.HelpWindow(self))
+
+    def open_detail_hover(self):
+        """Enter: 按当前悬停分区打开个股/指数大窗口, 持仓段打开持仓设置。"""
+        if self._hover_zone == "pnl":
+            self.open_holdings()
+        elif self._hover_zone == "index":
+            self.open_stock_detail(self.index_code)
+        else:
+            self.open_stock_detail(self._current_pick_code())
+
+    def open_stock_detail(self, code: str | None = None, name: str = ""):
+        """打开个股/指数详细窗口; 已打开则复用并切换股票。"""
+        code = D.normalize_code(code or self._current_pick_code())
+        if not code:
+            return
+        if name:
+            self._detail_names[code] = str(name)
+        win = self._dialogs.get("stock_detail")
+        if win is not None:
+            try:
+                win.show(code)
+                win.raise_()
+                return
+            except Exception:
+                self._dialogs.pop("stock_detail", None)
+        self._hide_card()
+        try:
+            sb_detail.StockDetailWindow(self, code)
+        except Exception:
+            import traceback
+            self._log("打开股票详情失败:\n" + traceback.format_exc())
 
     # ---------- 任务栏嵌入 ----------
     def _dock_pos(self, w: int | None = None, h: int | None = None,
