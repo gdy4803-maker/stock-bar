@@ -21,7 +21,8 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='看股插件V1.8.1',
+    name='股票智能选股悬浮窗V2.0.1',
+    icon='assets/logo.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -42,5 +43,6 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='看股插件V1.8.1',
+    name='股票智能选股悬浮窗V2.0.1',
 )
+

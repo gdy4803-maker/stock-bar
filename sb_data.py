@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import socket
 import time
 import urllib.parse
@@ -107,6 +108,13 @@ SINA_HEADERS = dict(HEADERS, Referer="https://finance.sina.com.cn")
 
 MARKETS = ("sh", "sz", "bj", "hk", "us")
 
+# 美股搜索源会带交易所后缀：usqqq.oq / usspy.am / usbrk.b.n。
+# 行情接口只认 usQQQ（不带后缀），K 线接口反而需要 .OQ/.N/.AM。
+_US_EXCHANGE_SUFFIXES = {"oq", "n", "am", "ny", "nasdaq", "nyse", "us"}
+_US_KLINE_EXCHANGES = ("OQ", "N", "AM")
+_US_KLINE_SUFFIX: dict[str, str] = {}
+
+
 TYPE_LABEL = {
     "GP-A": "A股", "GP-B": "B股", "ETF": "ETF", "ZS": "指数", "KCB": "科创板",
     "CYS": "创业板", "LOF": "LOF", "FJ": "分级", "QZ": "权证", "HK": "港股",
@@ -192,20 +200,50 @@ class Symbol:
 
 
 # ---------------- 代码规范化 ----------------
+def _normalize_us(raw: str) -> str:
+    """把美股代码统一为腾讯行情用的 usTICKER 形式。
+
+    QQQ / usqqq / usqqq.oq / QQQ.OQ      -> usQQQ
+    BRK.B / usBRK.B / usbrk.b.n          -> usBRK.B
+    交易所后缀只去掉最后一段，类别后缀（BRK.B 的 .B）保留。
+    """
+    body = str(raw or "").strip().lower().replace(" ", "")
+    if body.startswith("us"):
+        body = body[2:]
+    body = body.strip("$")
+    if not body:
+        return ""
+    parts = [p for p in body.split(".") if p]
+    if not parts:
+        return ""
+    if len(parts) >= 2 and parts[-1] in _US_EXCHANGE_SUFFIXES:
+        parts.pop()
+    ticker = ".".join(parts).upper()
+    if not ticker or not re.fullmatch(r"[A-Z0-9]+(?:[.\-][A-Z0-9]+)*", ticker):
+        return ""
+    return "us" + ticker
+
+
 def normalize_code(raw: str, as_index: bool = False) -> str:
-    """纯数字代码自动补市场前缀; 已带 sh/sz/bj/hk/us 前缀则原样返回。
+    """统一代码：A 股补市场前缀，美股去交易所后缀并补 us。
 
     规则:
       6/5 -> sh (沪市主板/科创板/ETF),  0/3/1 -> sz (深市/创业板/ETF),
       4/8 -> bj (北交所),  9 -> bj (北交所指数)
+      usQQQ / QQQ / usqqq.oq -> usQQQ；BRK.B / usbrk.b.n -> usBRK.B
       as_index=True: 000xxx -> sh, 399xxx -> sz, 899xxx -> bj
     """
     raw = str(raw or "").strip().lower().replace(" ", "")
     if not raw:
         return ""
-    if raw[:2] in MARKETS and len(raw) > 2:
+    if raw.startswith("us") and len(raw) > 2:
+        return _normalize_us(raw)
+    if raw[:2] in ("sh", "sz", "bj", "hk") and len(raw) > 2:
         return raw
     if not raw.isdigit():
+        # 不带前缀的字母代码按美股处理：QQQ、AAPL、BRK.B。
+        if re.fullmatch(r"[a-z0-9]+(?:[.\-][a-z0-9]+)*", raw) and any(c.isalpha() for c in raw):
+            return _normalize_us(raw)
         return raw
     if as_index:
         if raw.startswith("000"):
@@ -648,7 +686,22 @@ def _fetch_eastmoney(codes, index_set, timeout: float) -> dict[str, Quote]:
     """
     if not codes:
         return {}
-    secids = ",".join(("1." + c[2:] if c.startswith("sh") else "0." + c[2:]) for c in codes)
+    def _secid(c: str) -> list[str]:
+        if c.startswith("sh"):
+            return ["1." + c[2:]]
+        if c.startswith(("sz", "bj")):
+            return ["0." + c[2:]]
+        if c.startswith("hk"):
+            return ["116." + c[2:]]
+        if c.startswith("us"):
+            # 东财美股按交易所分区：105 纳指、106 纽交所、107 美交所。
+            return [m + "." + c[2:] for m in ("105", "106", "107")]
+        return []
+
+    secid_list = []
+    for c in codes:
+        secid_list.extend(_secid(c))
+    secids = ",".join(secid_list)
     fields = "f2,f3,f4,f5,f6,f12,f13,f14,f15,f16,f17,f18"
     url = EAST_URL.format(fields=fields, secids=secids)
     req = urllib.request.Request(url, headers={
@@ -668,13 +721,13 @@ def _fetch_eastmoney(codes, index_set, timeout: float) -> dict[str, Quote]:
         raise last_exc if last_exc else RuntimeError("东财无响应")
     payload = json.loads(raw.decode("utf-8", "replace"))
     rows = ((payload.get("data") or {}).get("diff")) or []
-    by_num = {c[2:]: c for c in codes}
+    by_num = {c[2:].upper(): c for c in codes}
     now = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
     out: dict[str, Quote] = {}
     for r in rows:
         if not isinstance(r, dict):
             continue
-        num = str(r.get("f12") or "")
+        num = str(r.get("f12") or "").upper()
         code = by_num.get(num)
         if not code:
             continue
@@ -709,10 +762,10 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
     交易所 L1 快照约 3s 一拍, 两源刷新相位不同, 合并后比任一单源更快看到新价。
     两源都失败时用东方财富兜底(第三源)。
     """
-    codes = [c for c in codes if c]
+    codes = [normalize_code(c) for c in codes if c]
     if not codes:
         return {}
-    index_set = set(index_codes or ())
+    index_set = {normalize_code(c) for c in (index_codes or ()) if c}
 
     from concurrent.futures import ThreadPoolExecutor
     tencent: dict[str, Quote] = {}
@@ -777,6 +830,7 @@ def fetch_quotes(codes, index_codes=(), timeout: float = 6.0) -> dict[str, Quote
 # ---------------- 分时 ----------------
 def fetch_minutes(code: str, timeout: float = 4.0) -> MinuteSeries | None:
     """拉取当日分时数据; 失败返回 None。"""
+    code = normalize_code(code)
     if not code:
         return None
     url = MINUTE_URL.format(code=code)
@@ -854,9 +908,9 @@ def fetch_minutes(code: str, timeout: float = 4.0) -> MinuteSeries | None:
 
 
 # ---------------- K线 ----------------
-def fetch_kline(code: str, period: str = "day", count: int = 320,
-                timeout: float = 6.0) -> list[KlineBar]:
-    """拉取前复权 K 线(日/周/月); 失败返回 []。指数无复权, 自动兼容 day/week/month。"""
+def _fetch_kline_one(code: str, period: str = "day", count: int = 320,
+                     timeout: float = 6.0) -> list[KlineBar]:
+    """单个腾讯代码的 K 线；code 必须与接口返回的 key 完全一致。"""
     if not code or period not in ("day", "week", "month"):
         return []
     url = KLINE_URL.format(code=code, period=period, count=max(10, int(count)))
@@ -892,9 +946,50 @@ def fetch_kline(code: str, period: str = "day", count: int = 320,
     return bars
 
 
+def fetch_kline(code: str, period: str = "day", count: int = 320,
+                timeout: float = 6.0) -> list[KlineBar]:
+    """拉取前复权 K 线(日/周/月); 失败返回 []。
+
+    美股行情代码是 usQQQ，但腾讯 K 线接口需要交易所后缀
+    （QQQ=.OQ、SPY=.AM、BRK.B=.N），因此按交易所顺序试一次并缓存。
+    """
+    code = normalize_code(code)
+    if not code or period not in ("day", "week", "month"):
+        return []
+    if not code.startswith("us"):
+        return _fetch_kline_one(code, period, count, timeout)
+
+    target = max(10, min(int(count), 60))
+    cached = _US_KLINE_SUFFIX.get(code)
+    candidates = []
+    if cached:
+        candidates.append(code + "." + cached)
+    candidates.extend(code + "." + suffix for suffix in _US_KLINE_EXCHANGES)
+    candidates.append(code)
+    candidates = list(dict.fromkeys(candidates))
+
+    best: list[KlineBar] = []
+    best_code = ""
+    for candidate in candidates:
+        try:
+            bars = _fetch_kline_one(candidate, period, count, timeout)
+        except Exception:
+            continue
+        if len(bars) > len(best):
+            best, best_code = bars, candidate
+        if len(best) >= target:
+            break
+    if best_code and best_code != code:
+        suffix = best_code.rsplit(".", 1)[-1]
+        if suffix in _US_KLINE_EXCHANGES:
+            _US_KLINE_SUFFIX[code] = suffix
+    return best
+
+
 # ---------------- 逐笔成交 ----------------
 def fetch_ticks(code: str, page: int = 0, timeout: float = 4.0) -> list[Tick]:
     """腾讯逐笔成交分页; p=0 最早, 页码递增向最新。空页返回 []。"""
+    code = normalize_code(code)
     if not code:
         return []
     url = TICK_URL.format(code=code, page=max(0, int(page)))
@@ -1062,10 +1157,16 @@ def search_symbols(keyword: str, timeout: float = 8.0) -> list[Symbol]:
         market, num, name, _pinyin, kind = parts[0], parts[1], parts[2], parts[3], parts[4]
         if market not in MARKETS or not num or not name:
             continue
-        code = market + num
-        if code in seen:
+        # 搜索源给美股代码带交易所后缀（usqqq.oq）；统一成 usQQQ，
+        # 否则加入自选后行情接口会查不到。
+        code = normalize_code(market + num)
+        if not code or code in seen:
             continue
         seen.add(code)
+        if market == "us" and "etf" in name.lower():
+            kind = "ETF"
+        elif market == "us":
+            kind = "US"
         out.append(Symbol(code=code, name=name, kind=kind))
     return out
 
@@ -1126,6 +1227,32 @@ def fmt_amount(amount: float) -> str:
     if a >= 1e4:
         return f"{a / 1e4:.2f}亿"
     return f"{a:,.0f}万"
+
+
+def fmt_quote_volume(code: str, volume: float) -> str:
+    """按市场显示成交量：A 股用「手」，港股/美股用「股」。"""
+    v = float(volume or 0)
+    if (code or "").lower().startswith(("hk", "us")):
+        if v >= 1e8:
+            return f"{v / 1e8:.2f}亿股"
+        if v >= 1e4:
+            return f"{v / 1e4:.2f}万股"
+        return f"{v:,.0f}股"
+    return fmt_volume(v)
+
+
+def fmt_quote_amount(code: str, amount: float) -> str:
+    """按市场显示成交额：A 股用万元/亿元，美股用美元，港股用港元。"""
+    a = float(amount or 0)
+    prefix = (code or "").lower()[:2]
+    unit = "美元" if prefix == "us" else ("港元" if prefix == "hk" else "")
+    if unit:
+        if a >= 1e8:
+            return f"{a / 1e8:.2f}亿{unit}"
+        if a >= 1e4:
+            return f"{a / 1e4:.2f}万{unit}"
+        return f"{a:,.0f}{unit}"
+    return fmt_amount(a)
 
 
 def fmt_yi_wan(value: float) -> str:
@@ -1610,11 +1737,12 @@ def _snapshot_eastmoney(min_pct, min_amount, limit, timeout):
 
 
 def llm_key(cfg=None) -> str:
-    """API Key: 优先 config.json 的 llm_key, 没有则读环境变量 STOCKBAR_LLM_KEY。"""
+    """API Key: config.json 的 llm_key 优先；环境变量 STOCKPICK_LLM_KEY，兼容旧 STOCKBAR_LLM_KEY。"""
     k = ""
     if isinstance(cfg, dict):
         k = str(cfg.get("llm_key") or "").strip()
-    return k or os.environ.get("STOCKBAR_LLM_KEY", "").strip()
+    return (k or os.environ.get("STOCKPICK_LLM_KEY", "").strip()
+            or os.environ.get("STOCKBAR_LLM_KEY", "").strip())
 
 
 def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 60.0):
@@ -1626,7 +1754,7 @@ def llm_ask(cfg, prompt: str, system: str = "", timeout: float = 60.0):
         return None, "未启用 AI 研判(设置里开启)"
     key = llm_key(cfg)
     if not key:
-        return None, "未配置 API Key(设置里填写, 或设置环境变量 STOCKBAR_LLM_KEY)"
+        return None, "未配置 API Key(设置里填写, 或设置环境变量 STOCKPICK_LLM_KEY)"
     base = str(cfg.get("llm_base") or "").strip().rstrip("/")
     model = str(cfg.get("llm_model") or "").strip()
     if not base:
@@ -1684,9 +1812,12 @@ def change_color(pct, pal: dict) -> str:
 
 
 def fmt_quote_time(raw: str) -> str:
-    raw = str(raw or "")
-    if len(raw) >= 14:
-        return f"{raw[8:10]}:{raw[10:12]}:{raw[12:14]}"
+    """行情时间统一显示为 HH:MM:SS；兼容 A 股纯数字与港美股带日期分隔符。"""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) >= 14:
+        return f"{digits[8:10]}:{digits[10:12]}:{digits[12:14]}"
+    if len(digits) >= 6:
+        return f"{digits[-6:-4]}:{digits[-4:-2]}:{digits[-2:]}"
     return "--:--:--"
 
 

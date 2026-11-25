@@ -517,16 +517,18 @@ def build_prompt(ctx: AIContext, quality: DataQuality, phase: dict | None = None
     ]
     if q is not None:
         pct = D.today_pct(q)
+        overseas = ctx.code[:2] in ("us", "hk")
         lines += [
             "- 最新: %.2f, 昨收 %.2f, 今开 %.2f, 高 %.2f, 低 %.2f, 涨跌 %s"
             % (q.price, q.prev_close, q.open, q.high, q.low,
                D.fmt_pct(pct) if pct is not None else "-"),
-            "- 成交: %s 手, 成交额 %s, 换手 %s, 量比 %s" % (
-                D.fmt_volume(q.volume), D.fmt_amount(q.amount),
-                ("%.2f%%" % q.turnover) if q.turnover else "-",
-                ("%.2f" % q.volume_ratio) if q.volume_ratio else "-"),
+            "- 成交: %s, 成交额 %s, 换手 %s, 量比 %s" % (
+                D.fmt_quote_volume(ctx.code, q.volume), D.fmt_quote_amount(ctx.code, q.amount),
+                "-" if overseas else (("%.2f%%" % q.turnover) if q.turnover else "-"),
+                "-" if overseas else (("%.2f" % q.volume_ratio) if q.volume_ratio else "-"),
+            ),
         ]
-        if not ctx.is_index:
+        if not ctx.is_index and not overseas:
             lines.append("- 五档: 买一 %s/%s 手, 卖一 %s/%s 手" % (
                 D.fmt_price(q.bid1, q.dp), D.fmt_volume(q.bid1_vol),
                 D.fmt_price(q.ask1, q.dp), D.fmt_volume(q.ask1_vol)))

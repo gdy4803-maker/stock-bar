@@ -469,8 +469,8 @@ class InfoCard:
         # 开盘后表现(9:30 后复盘时很有用)
         if q.open > 0:
             extra.append(f"- 开盘后实况: 今开 {q.open:.2f}, 最新 {q.price:.2f}"
-                         f"({q.pct:+.2f}%), 成交 {D.fmt_volume(q.volume)}手,"
-                         f"成交额 {D.fmt_yi_wan(q.amount * 10000)}")
+                         f"({q.pct:+.2f}%), 成交 {D.fmt_quote_volume(q.code, q.volume)},"
+                         f"成交额 {D.fmt_quote_amount(q.code, q.amount)}")
         # 历史统计 + 基本面 + 技术分析(来自开源 MCP 数据服务 full 级别)
         brief = D.mcp_stock_brief(code, level="full")
         if brief:
@@ -811,7 +811,8 @@ class InfoCard:
             ("昨收", D.fmt_price(q.prev_close, q.dp), "最低", D.fmt_price(q.low, q.dp)),
         ]
         if not q.is_index:
-            rows.append(("成交量", D.fmt_volume(q.volume), "成交额", D.fmt_amount(q.amount)))
+            rows.append(("成交量", D.fmt_quote_volume(q.code, q.volume),
+                         "成交额", D.fmt_quote_amount(q.code, q.amount)))
         col_w = (w - 2 * pad - int(22 * S)) / 2
         for i, (k1, v1, k2, v2) in enumerate(rows):
             yy = p["grid"] + i * 20 * S
@@ -1169,6 +1170,7 @@ class BaseDialog:
         self.win.deiconify()
         self.win.update_idletasks()
         apply_dark_titlebar(self.win, self.pal.get("name") == "dark")
+        self.apply_window_opacity()
         force_topmost(self.win)
         self.win.lift()
         self.win.focus_force()
@@ -1176,9 +1178,22 @@ class BaseDialog:
         if self.key:
             app._dialogs[self.key] = self
 
+    def apply_window_opacity(self):
+        try:
+            alpha = float(self.app.cfg.get("window_opacity", 1.0))
+        except (TypeError, ValueError):
+            alpha = 1.0
+        alpha = max(0.40, min(1.0, alpha))
+        try:
+            self.win.attributes("-alpha", alpha)
+        except tk.TclError:
+            pass
+        return alpha
+
     def on_app_settings(self):
         """外观设置变更后的统一入口；子类可覆盖并重绘自定义画布。"""
         self.pal = self.app.pal
+        self.apply_window_opacity()
 
     # ---- 窗口缩放: 由系统原生边框处理, 这里只做回调分发 ----
     def set_resize_handler(self, on_resize=None, on_release=None):
@@ -1390,6 +1405,12 @@ class SettingsWindow(BaseDialog):
         r = self.row(sec, "卡片透明度")
         Slider(r, int(round(float(self.app.cfg.get("card_opacity", 1.0)) * 100)), 10, 100,
                self._set_card_opacity, pal, self.fonts, scale=S, width=264).pack(side="left", pady=2)
+        r = self.row(sec, "窗口不透明度")
+        Slider(r, int(round(float(self.app.cfg.get("window_opacity", 1.0)) * 100)), 40, 100,
+               self._set_window_opacity, pal, self.fonts, scale=S, width=264).pack(side="left", pady=2)
+        tk.Label(r, text="设置/帮助/详细/标签等所有窗口",
+                 bg=pal["panel_alt"], fg=pal["faint"],
+                 font=self.fonts.tiny()).pack(side="left", padx=(10, 0))
 
     def _build_window(self, parent):
         pal = self.pal
@@ -1860,6 +1881,10 @@ class SettingsWindow(BaseDialog):
         self.app.cfg["card_opacity"] = max(0.10, min(1.0, value / 100.0))
         self._apply()          # 卡片开着时 refresh() 内即时应用新透明度
 
+    def _set_window_opacity(self, value):
+        self.app.cfg["window_opacity"] = max(0.40, min(1.0, value / 100.0))
+        self._apply()
+
     def _set_card_mode(self, value):
         self.app.cfg["card_mode"] = value
         self._apply()
@@ -2029,7 +2054,7 @@ class HelpWindow(BaseDialog):
         super().__init__(app, "使用帮助", 880, 800, min_size=(660, 540))
         self._wrap_items = []
         self._build_footer()
-        self.header("使用帮助", "从快速上手到进阶功能，一页看懂")
+        self.header("使用帮助", "StockPick · 基于 AI 大模型的选股悬浮窗，从快速上手到进阶功能")
         body = self._build_scroll_body()
         self._build_quick_start(body)
         self._build_bar(body)
@@ -2229,7 +2254,9 @@ class HelpWindow(BaseDialog):
     # ---- 01 快速开始 ----
     def _build_quick_start(self, parent):
         sec = self._card(parent, "01", "快速开始")
-        self._p(sec, f"双击 看股插件V{self.app.version}.exe 即可运行，免安装。"
+        self._p(sec, "股票智能选股悬浮窗（StockPick）是基于 AI 大模型的桌面选股悬浮窗："
+                     "把实时行情、板块成分、标签内选股和 AI 研判压缩成一条不打扰的悬浮条。")
+        self._p(sec, f"双击 {self.app.name}V{self.app.version}.exe 即可运行，免安装。"
                      "首次启动会在程序目录生成 config.json，自选、持仓和所有设置都存在这里。")
         self._step(sec, 1, "启动后行情条默认位于屏幕右下角。按住左键可拖到任意位置；"
                            "拖到任务栏会自动吸附。")
@@ -2287,6 +2314,8 @@ class HelpWindow(BaseDialog):
         self._bullet(sec, "界面配色：深色 / 浅色；字号 10 / 12 / 14 / 16。")
         self._bullet(sec, "显示名称：关闭后自选段只显示涨跌幅，适合极简桌面。")
         self._bullet(sec, "文字 / 背景 / 卡片不透明度：背景调到 0% 就是纯文字模式。")
+        self._bullet(sec, "窗口不透明度：40%–100%，统一作用于设置、帮助、详细、标签成分等所有弹窗；"
+                          "行情条本身仍用上面的文字/背景透明度，悬停卡用卡片透明度。")
         self._sub(sec, "窗口")
         self._bullet(sec, "窗口置顶：始终显示在最前。")
         self._bullet(sec, "嵌入任务栏：固定在任务栏；开启时自动避开已有图标，之后跟随宽度不搬家。")
@@ -2301,9 +2330,9 @@ class HelpWindow(BaseDialog):
         self._sub(sec, "交易手续费")
         self._bullet(sec, "股票佣金、ETF 佣金、卖出印花税；持仓窗口按这里的费率自动估算费用。")
         self._sub(sec, "AI 研判")
-        self._bullet(sec, "自动研判：开启后 9:25 对当前股票自动跑一次，每天一次。")
+        self._bullet(sec, "竞价卡自动研判：开启后 9:25 对当前股票自动跑一次，每天一次。")
         self._bullet(sec, "服务商：DeepSeek / MIMO / 自定义（OpenAI 兼容接口）。")
-        self._bullet(sec, "接口地址、模型名、API Key；Key 可留空，程序会读环境变量 STOCKBAR_LLM_KEY。")
+        self._bullet(sec, "接口地址、模型名、API Key；Key 可留空，程序会读环境变量 STOCKPICK_LLM_KEY（兼容旧 STOCKBAR_LLM_KEY）。")
         self._sub(sec, "更新与支持")
         self._bullet(sec, "更新：显示当前版本，可立即检查；发现新版本时出现“更新”按钮。")
         self._bullet(sec, "支持开发者：扫码窗；源码仓库：一键复制地址。")
@@ -2352,8 +2381,9 @@ class HelpWindow(BaseDialog):
         self._bullet(sec, "规则评分 = 五项得分直接相加，不依赖大模型；没有配置 AI 也能使用。"
                           "训练权重只作模型参考，不覆盖规则总分。")
         self._sub(sec, "AI 研判")
-        self._bullet(sec, "在设置里填服务商、接口、模型、API Key；开启“自动研判”后 9:25 自动跑一次。")
-        self._bullet(sec, "也可在竞价卡上点「AI 研判」，或悬停时按 T 立即研判当前股票。")
+        self._bullet(sec, "在设置里填服务商、接口、模型、API Key；开启“自动研判”后 9:25 对竞价卡自动跑一次。")
+        self._bullet(sec, "也可在竞价卡上点「AI 研判」，或悬停时按 T 立即研判当前股票；"
+                          "详细窗口/标签成分窗口只在点“重新研判/立即研判”时请求。")
         self._bullet(sec, "输出包含综合研判、核心理由、风险、操作倾向；需要联网，通常几秒到几十秒。")
         self._p(sec, "AI 与评分都只作为辅助信息，不构成投资建议。", color=self.pal["warn"])
 
@@ -2409,7 +2439,21 @@ class HelpWindow(BaseDialog):
                           "切换深浅主题时详细窗口也会自动重建，不再沿用旧配色。")
         self._bullet(sec, "港股/美股行情时间格式已兼容，涨跌幅不再恒为 0%；"
                           "A 股开盘前的昨日行情仍按 0% 处理。")
-        self._sub(sec, "窗口结构（1.8.0）")
+        self._sub(sec, "2.0.1 修复")
+        self._bullet(sec, "搜索支持 A股/港股/美股/ETF；QQQ 等无前缀代码、搜索结果里的 .oq/.am/.n 后缀，"
+                          "会自动归一为 usQQQ 形式，加入自选后能正常拉到行情。")
+        self._bullet(sec, "美股 K 线自动匹配交易所后缀（QQQ=.OQ、SPY=.AM、BRK.B=.N），"
+                          "不再只显示一根 K 线；分时在美股休市时只显示最新价。")
+        self._sub(sec, "2.0.0 新增")
+        self._bullet(sec, "板块/概念标签可点击：打开独立的「标签成分」窗口，左侧列出该标签下全部 A 股，"
+                          "右侧沿用详细窗口的分时/K线、五档逐笔、板块标签、狙击点位与 AI 研判。")
+        self._bullet(sec, "标签成分窗口为单例：重复点标签会复用并切换标签；几何、置顶、左栏宽度独立记忆，"
+                          "不覆盖原详细窗口的布局。")
+        self._bullet(sec, "标签内选股：左栏每只成分右侧有 +，点一下直接加入自选；"
+                          "点顶部「AI 选股」先按涨幅/成交额/换手/量比初筛，再由大模型复核出 3–6 只观察候选。")
+        self._bullet(sec, "详细窗口与标签成分窗口的 AI 研判改为手动触发：滚动到 AI 不再自动请求，"
+                          "点右上角「重新研判」或下方「立即研判」才调用模型。")
+        self._sub(sec, "窗口结构（2.0.0）")
         self._bullet(sec, "左栏：全高自选股列表，与右侧图表分开；顶部搜索框宽度跟随左栏，"
                           "下面列表独立滚动。搜索支持代码/名称/拼音；点结果切股，"
                           "点 + 加入自选，已在自选显示 ✓。")
@@ -2436,6 +2480,15 @@ class HelpWindow(BaseDialog):
         self._bullet(sec, "标签带当日板块涨幅；红涨绿跌跟随主题。指数/风格/资金属性标签"
                           "（沪深300、上证50、融资融券、基金重仓、大盘/中盘/小盘等）会被过滤。")
         self._bullet(sec, "按股票代码缓存 30 分钟；网络失败静默降级为空标签，不影响行情和 AI。")
+        self._bullet(sec, "标签 chip 可点击（手型光标）：打开独立标签成分窗口；点「+N 全部」可查看全部标签。")
+        self._sub(sec, "标签成分窗口（2.0.0）")
+        self._bullet(sec, "左栏是该标签下全部 A 股（过滤 B 股），按涨跌幅降序；超过一屏时左栏内部滚动，"
+                          "顶部搜索只过滤当前标签成分，不会查全市场。")
+        self._bullet(sec, "每行右侧「+」直接加自选；顶部「AI 选股」手动触发标签内选股，"
+                          "规则初筛 20 只后交给大模型复核，结果按排名显示，点「全部」恢复全成分。")
+        self._bullet(sec, "右侧与详细窗口一致：分时/K线/周期/指标、五档逐笔、板块标签、狙击点位、AI 研判；"
+                          "点左栏股票切换，来源股票若不在成分中会选中第一只。")
+        self._bullet(sec, "成分来自东方财富板块接口，分页拉取并缓存 30 分钟；大板块首次打开可能需要几秒。")
         self._sub(sec, "狙击点位（1.8.0）")
         self._bullet(sec, "点位由程序按 180 根前复权日线计算，AI 不自由报价；"
                           "AI 只能从带编号的候选里选，价格不能新增或改写。")
@@ -2460,8 +2513,8 @@ class HelpWindow(BaseDialog):
                           "五档/逐笔缺失、指数无盘口等；不让模型编造数据。")
         self._bullet(sec, "启用狙击点位后，Prompt 追加规则候选编号；AI 只能返回 I/S/L/T 编号，"
                           "不能写价格。程序负责复核，失败自动回退规则默认。")
-        self._bullet(sec, "第一次滚动到 AI 且当前阶段无缓存时自动研判；按代码+日期+阶段缓存；"
-                          "右上角「重新研判」可强制刷新。未启用或没填 API Key 时只显示设置入口，不请求接口。")
+        self._bullet(sec, "AI 研判为手动触发：滚动到 AI 不会自动请求；点右上角「重新研判」或下方「立即研判」才调用模型。"
+                          "按代码+日期+阶段缓存；未启用或没填 API Key 时只显示设置入口，不请求接口。")
         self._sub(sec, "鼠标操作")
         self._bullet(sec, "拖动：按住左键左右拖动平移；双击复位到全览。")
         self._bullet(sec, "单击：锁定十字光标，再单击解锁；竖线联动主图、成交量与指标区。")
@@ -2475,6 +2528,7 @@ class HelpWindow(BaseDialog):
         self._bullet(sec, "逐笔来自腾讯最近成交分页，不是 Level-2；免费接口可能有延迟。")
         self._sub(sec, "窗口")
         self._bullet(sec, "位置、大小与左栏宽度自动记忆；右上角「置顶」可切换是否总在最前；Esc 关闭。")
+        self._bullet(sec, "设置 → 外观「窗口不透明度」统一控制详细/标签/设置/帮助等窗口，40%–100%。")
         self._p(sec, "K 线中的 MA5/MA10/MA20 颜色与图例一致；MACD 的 DIF/DEA、"
                      "KDJ 的 K/D/J 也在指标区左上角标注。",
                 color=self.pal["muted"], pady=(6, 0))
@@ -2932,8 +2986,8 @@ class ManageStocksWindow(BaseDialog):
         CanvasButton(search, "搜索", self._search_now, pal, self.fonts, kind="primary",
                      width=66, height=32, scale=self.S, bg=pal["panel_alt"]).pack(
             side="left", padx=8, pady=7)
-        tk.Label(search, text="支持名称、代码、拼音首字母，如 茅台、510300", bg=pal["panel_alt"],
-                 fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(2, 12))
+        tk.Label(search, text="支持名称、代码、拼音首字母；A股/港股/美股/ETF，如 茅台、510300、QQQ",
+                 bg=pal["panel_alt"], fg=pal["faint"], font=self.fonts.tiny()).pack(side="left", padx=(2, 12))
 
         lists = tk.Frame(body, bg=pal["panel"])
         lists.pack(fill="both", expand=True, pady=(10, 0))

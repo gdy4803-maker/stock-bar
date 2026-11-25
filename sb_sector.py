@@ -16,9 +16,17 @@ from dataclasses import dataclass
 import sb_data as D
 
 SECTOR_URL = "https://push2.eastmoney.com/api/qt/slist/get"
+MEMBERS_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+# 主站对本机 clist 偶发 WAF 断连；push2test 同结构接口可作只读兜底。
+MEMBERS_FALLBACK_URL = "https://push2test.eastmoney.com/api/qt/clist/get"
 _CACHE_TTL = 1800.0
 _FAIL_TTL = 900.0
+_MEMBER_FAIL_TTL = 60.0
 _CACHE: dict[str, tuple[float, list["SectorTag"]]] = {}
+_MEMBER_CACHE: dict[str, tuple[float, list["BoardMember"]]] = {}
+_PREFERRED_MEMBERS_URL = MEMBERS_URL
+_PREFERRED_TS = 0.0
+_MEMBER_LAST_ERROR = ""
 _LOCK = threading.Lock()
 
 # 指数/风格/资金属性标签：不是用户想看的行业或概念，默认不展示。
@@ -66,6 +74,18 @@ class SectorTag:
     def kind_label(self) -> str:
         return {"industry": "行业", "region": "地域", "concept": "概念"}.get(
             self.kind, "概念")
+
+
+@dataclass(slots=True)
+class BoardMember:
+    """板块成分股快照；price/pct/成交额/换手/量比来自东财板块接口，非实时逐笔。"""
+    code: str
+    name: str
+    price: float = 0.0
+    pct: float = 0.0
+    amount: float = 0.0       # 成交额(元)
+    turnover: float = 0.0     # 换手率(%)
+    vol_ratio: float = 0.0    # 量比
 
 
 def _is_style(name: str) -> bool:
@@ -160,6 +180,156 @@ def fetch_tags(code: str, timeout: float = 5.0) -> list[SectorTag]:
         return []
 
 
+def _num(value) -> float:
+    try:
+        text = str(value).strip().replace(",", "")
+        return float(text) if text and text != "-" else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _member_page(bk_code: str, page: int, page_size: int = 100,
+                 timeout: float = 6.0, url: str | None = None) -> tuple[list[dict], int]:
+    """拉取板块成分单页；返回 (rows, total)。"""
+    params = {
+        "pn": str(max(1, int(page))), "pz": str(max(1, int(page_size))),
+        "po": "1", "np": "1", "fltt": "2", "invt": "2",
+        "ut": "8dec03ba335b81bf4ebdf7b29ec27d15",
+        "fid": "f3", "fs": "b:" + bk_code,
+        "fields": "f12,f14,f2,f3,f6,f8,f10",
+    }
+    url = url or MEMBERS_URL
+    url = url + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": D.HEADERS["User-Agent"],
+        "Referer": "https://quote.eastmoney.com/",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    data = payload.get("data") or {}
+    rows = data.get("diff") or []
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    try:
+        total = int(data.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    return rows, total
+
+
+def fetch_members(bk_code: str, timeout: float = 6.0) -> list["BoardMember"]:
+    """拉取某行业/概念/地域板块的全部 A 股成分。
+
+    东财单页上限 100，大概念（如“央国企改革”1451只）需要 15 页；
+    主站被 WAF 断连时自动切到 push2test 只读兜底；结果缓存 30 分钟。
+    网络失败返回空列表，不阻塞 UI。
+    """
+    bk_code = str(bk_code or "").strip().upper()
+    if not bk_code.startswith("BK"):
+        return []
+    global _PREFERRED_MEMBERS_URL, _PREFERRED_TS, _MEMBER_LAST_ERROR
+    now = time.time()
+    with _LOCK:
+        cached = _MEMBER_CACHE.get(bk_code)
+    if cached:
+        ttl = _CACHE_TTL if cached[1] else _MEMBER_FAIL_TTL
+        if now - cached[0] < ttl:
+            return list(cached[1])
+
+    def parse(rows: list[dict]) -> list[BoardMember]:
+        out: list[BoardMember] = []
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            num = str(row.get("f12") or "").strip()
+            if not (len(num) == 6 and num.isdigit()):
+                continue
+            if num.startswith(("200", "900")):     # B 股
+                continue
+            # 板块接口有时混入 ETF/LOF；这里只保留 A 股。
+            if num.startswith(("15", "16", "18", "51", "56", "58")):
+                continue
+            code = D.normalize_code(num)
+            if code[:2] not in ("sh", "sz", "bj") or code in seen:
+                continue
+            seen.add(code)
+            out.append(BoardMember(
+                code=code,
+                name=str(row.get("f14") or code).strip(),
+                price=_num(row.get("f2")),
+                pct=_num(row.get("f3")),
+                amount=_num(row.get("f6")),
+                turnover=_num(row.get("f8")),
+                vol_ratio=_num(row.get("f10")),
+            ))
+        out.sort(key=lambda m: (-m.pct, m.code))
+        return out
+
+    try:
+        with _LOCK:
+            preferred = (_PREFERRED_MEMBERS_URL
+                         if now - _PREFERRED_TS < 300.0 else MEMBERS_URL)
+        urls = []
+        for u in (preferred, MEMBERS_URL, MEMBERS_FALLBACK_URL):
+            if u not in urls:
+                urls.append(u)
+        selected_url = ""
+        first_rows: list[dict] = []
+        total = 0
+        last_err = None
+        for u in urls:
+            try:
+                first_rows, total = _member_page(bk_code, 1, 100, timeout, url=u)
+                if first_rows:
+                    selected_url = u
+                    break
+            except Exception as exc:
+                last_err = exc
+                continue
+        if not first_rows or not selected_url:
+            with _LOCK:
+                _MEMBER_LAST_ERROR = str(last_err or "板块无成分数据")[:160]
+            raise RuntimeError("板块无成分数据")
+        rows = list(first_rows)
+        pages = max(1, (max(total, len(first_rows)) + 99) // 100)
+        # 东财对短时间连续请求很敏感：顺序翻页并留小间隔，避免大板块触发风控。
+        for page in range(2, min(pages, 40) + 1):
+            try:
+                page_rows, _ = _member_page(bk_code, page, 100, timeout,
+                                            url=selected_url)
+                rows.extend(page_rows)
+            except Exception:
+                # 单页失败不拖垮整个列表；间隔后重试一次。
+                try:
+                    time.sleep(0.5)
+                    page_rows, _ = _member_page(bk_code, page, 100, timeout,
+                                                url=selected_url)
+                    rows.extend(page_rows)
+                except Exception:
+                    continue
+            time.sleep(0.35)
+        members = parse(rows)
+        with _LOCK:
+            _MEMBER_CACHE[bk_code] = (now, list(members))
+            _PREFERRED_MEMBERS_URL = selected_url
+            _PREFERRED_TS = now
+            _MEMBER_LAST_ERROR = ""
+        return members
+    except Exception as exc:
+        with _LOCK:
+            _MEMBER_CACHE[bk_code] = (now, [])
+            _MEMBER_LAST_ERROR = str(exc)[:160]
+        return []
+
+
+def member_last_error() -> str:
+    """最近一次成分拉取失败原因；成功时为空。"""
+    with _LOCK:
+        return _MEMBER_LAST_ERROR
+
+
 def clear_cache() -> None:
     with _LOCK:
         _CACHE.clear()
+        _MEMBER_CACHE.clear()

@@ -20,6 +20,7 @@ import sb_ai as A
 import sb_data as D
 import sb_levels as LV
 import sb_sector as SEC
+import sb_pick as PK
 import sb_ui
 from sb_theme import draw_round_rect
 from sb_widgets import CanvasButton, Segmented, make_entry, setup_ttk
@@ -102,8 +103,10 @@ class StockDetailWindow(sb_ui.BaseDialog):
 
     key = "stock_detail"
 
-    def __init__(self, app, code: str):
+    def __init__(self, app, code: str, scope_tag=None, layout_prefix: str = "detail"):
         self.app = app
+        self.scope_tag = scope_tag
+        self._layout_prefix = layout_prefix
         self.code = code
         self.q = app.quotes.get(code)
         self.mode = "minute"
@@ -129,7 +132,8 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self._side_rows = []
         self._side_visible = True
         # 1.7.0 布局 / 左栏 / 页面滚动 / AI
-        self._left_width = int(app.cfg.get("detail_left_width") or 220)
+        self._left_width = int(app.cfg.get(layout_prefix + "_left_width")
+                               or app.cfg.get("detail_left_width") or 220)
         self._left_rows = []
         self._search_results = []
         self._search_job = None
@@ -137,6 +141,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self._search_focus = False
         self._split_drag = None
         self._page_syncing = False
+        self._left_draw_guard = False
         self._ai_result = None
         self._ai_results: dict[str, A.AIResult] = {}
         self._ai_busy = False
@@ -147,6 +152,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self._ai_wrap_labels = []
         # 1.8.0 板块标签 / 规则候选点位 / AI 选点
         self._sector_tags: list = []
+        self._tag_hits: list = []
         self._level_plan = None
         self._level_ts = 0.0
         self._aux_gen = 0
@@ -154,12 +160,28 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self._daily_bars_cache: dict[str, tuple[float, list]] = {}
         self._research_visible = True
         self._after_ids = []
-        self._topmost = bool(app.cfg.get("detail_topmost", True))
+        # 1.9.0 标签成分窗口
+        self._tag_members: list = []
+        self._tag_member_by_code: dict[str, object] = {}
+        self._tag_loaded = False
+        self._tag_busy = False
+        self._tag_gen = 0
+        # 1.9.1 标签内选股: 规则初筛 + 手动 AI 复核
+        self._tag_pick_mode = False
+        self._tag_pick_results: list = []      # [(BoardMember, score, reason)]
+        self._tag_pick_rank: dict[str, int] = {}
+        self._tag_pick_reason: dict[str, str] = {}
+        self._tag_pick_busy = False
+        self._tag_pick_gen = 0
+        self._tag_pick_candidates: list = []
+        self._topmost = bool(app.cfg.get(layout_prefix + "_topmost")
+                             if app.cfg.get(layout_prefix + "_topmost") is not None
+                             else app.cfg.get("detail_topmost", True))
         self._top_h = int(468 * app.scale)
         name = (self.q.name if self.q else
                 (getattr(app, "_detail_names", {}) or {}).get(code) or
                 D.code_digits(code)) or code
-        super().__init__(app, "%s %s" % (name, D.code_digits(code)),
+        super().__init__(app, self._title_text(name, code),
                          1280, 800, min_size=(1120, 680))
         self._restore_geometry()
         self._build_ui()
@@ -170,6 +192,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
         except tk.TclError:
             pass
         self.show(code)
+        self._start_tag_members()
         self.win.after(100, self._poll_async)
         self._timer_quote()
         self._timer_minute()
@@ -189,17 +212,22 @@ class StockDetailWindow(sb_ui.BaseDialog):
         if new_pal.get("name") != old_name:
             # 主题切换时大量 Tk 控件的背景色已在构建时固化，重建窗口最稳。
             code = self.code
+            tag = self.scope_tag
             try:
                 self.close()
             except Exception:
                 pass
             try:
-                self.app.open_stock_detail(code)
+                if tag is not None:
+                    self.app.open_tag_stock_window(tag, code)
+                else:
+                    self.app.open_stock_detail(code)
             except Exception:
                 pass
             return
         self.pal = new_pal
         self.fonts = self.app.ui_fonts
+        self.apply_window_opacity()
         for widget, key in (
             (getattr(self, "win", None), "panel"),
             (getattr(self, "shell", None), "panel"),
@@ -238,8 +266,15 @@ class StockDetailWindow(sb_ui.BaseDialog):
             pass
 
     # ---------------- 窗口/构建 ----------------
+    def _title_text(self, name: str, code: str) -> str:
+        if self.scope_tag is not None:
+            return "%s · %d只  |  %s %s" % (
+                self.scope_tag.name, len(self._tag_members or []),
+                name, D.code_digits(code))
+        return "%s %s" % (name, D.code_digits(code))
+
     def _restore_geometry(self):
-        g = self.app.cfg.get("detail_geometry")
+        g = self.app.cfg.get(self._layout_prefix + "_geometry")
         if not isinstance(g, dict):
             return
         try:
@@ -259,14 +294,15 @@ class StockDetailWindow(sb_ui.BaseDialog):
 
     def _save_geometry(self):
         try:
-            self.app.cfg["detail_geometry"] = {
+            prefix = self._layout_prefix
+            self.app.cfg[prefix + "_geometry"] = {
                 "w": int(self.win.winfo_width()),
                 "h": int(self.win.winfo_height()),
                 "x": int(self.win.winfo_x()),
                 "y": int(self.win.winfo_y()),
             }
-            self.app.cfg["detail_topmost"] = bool(self._topmost)
-            self.app.cfg["detail_left_width"] = int(self._left_width)
+            self.app.cfg[prefix + "_topmost"] = bool(self._topmost)
+            self.app.cfg[prefix + "_left_width"] = int(self._left_width)
             self.app.save_config()
         except Exception:
             pass
@@ -298,6 +334,11 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self.search.bind("<Escape>", self._on_search_escape)
         self.search.bind("<Return>", self._on_search_enter)
 
+        self.pick_bar = None
+        self.pick_status = None
+        if self.scope_tag is not None:
+            self._build_tag_pick_bar()
+
         self.left_note = tk.Label(self.left, text="", bg=pal["panel"],
                                   fg=pal["faint"], font=F.tiny(), anchor="w")
         self.left_note.pack(fill="x", padx=int(12 * S))
@@ -307,9 +348,9 @@ class StockDetailWindow(sb_ui.BaseDialog):
                                    highlightthickness=0, bd=0)
         self.left_list.pack(side="left", fill="both", expand=True)
         self.left_sb = ttk.Scrollbar(self.left_body, orient="vertical",
-                                     command=self.left_list.yview)
+                                     command=self._left_sb_cmd)
         self.left_sb.pack(side="right", fill="y")
-        self.left_list.configure(yscrollcommand=self.left_sb.set,
+        self.left_list.configure(yscrollcommand=self._left_scroll_cb,
                                  yscrollincrement=int(16 * S))
         self.left_list.bind("<Configure>", lambda e: self._draw_left())
         self.left_list.bind("<Button-1>", self._on_left_click)
@@ -391,6 +432,26 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self.win.after(60, self._draw_left)
         self.win.after(80, lambda: self._set_left_width(self._left_width))
 
+    def _build_tag_pick_bar(self):
+        """标签窗口专用: 手动触发 AI 选股，结果替换左栏列表。"""
+        pal, S, F = self.pal, self.S, self.fonts
+        self.pick_bar = tk.Frame(self.left, bg=pal["panel"])
+        self.pick_bar.pack(fill="x", padx=int(10 * S), pady=(0, int(3 * S)))
+        btn_row = tk.Frame(self.pick_bar, bg=pal["panel"])
+        btn_row.pack(fill="x")
+        self.pick_btn = CanvasButton(
+            btn_row, "AI 选股", self._start_tag_pick, pal, F,
+            kind="primary", width=80, height=26, scale=S)
+        self.pick_btn.pack(side="left")
+        self.pick_all_btn = CanvasButton(
+            btn_row, "全部", self._clear_tag_pick, pal, F,
+            kind="quiet", width=48, height=26, scale=S)
+        self.pick_all_btn.pack(side="left", padx=(int(5 * S), 0))
+        self.pick_status = tk.Label(
+            self.pick_bar, text="点 + 加自选", bg=pal["panel"],
+            fg=pal["faint"], font=F.tiny(), anchor="w")
+        self.pick_status.pack(fill="x", pady=(int(2 * S), 0))
+
     def _build_control_row(self):
         pal, S = self.pal, self.S
         F = self.fonts
@@ -418,7 +479,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
         pal, S = self.pal, self.S
         F = self.fonts
         self.tags_panel = tk.Frame(
-            self.page_inner, bg=pal["panel_alt"], height=int(94 * S),
+            self.page_inner, bg=pal["panel_alt"], height=int(118 * S),
             highlightthickness=1, highlightbackground=pal["border"])
         self.tags_panel.pack(fill="x", padx=int(12 * S), pady=(int(6 * S), 0))
         self.tags_panel.pack_propagate(False)
@@ -431,10 +492,12 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self.tags_note.pack(side="right")
         self.tags_canvas = tk.Canvas(
             self.tags_panel, bg=pal["panel_alt"], highlightthickness=0, bd=0,
-            height=int(60 * S))
+            height=int(84 * S))
         self.tags_canvas.pack(fill="x", expand=True, padx=int(12 * S),
                               pady=(0, int(4 * S)))
         self.tags_canvas.bind("<Configure>", lambda e: self._draw_tags())
+        self.tags_canvas.bind("<Button-1>", self._on_tag_click)
+        self.tags_canvas.bind("<Motion>", self._on_tag_motion)
 
     def _build_level_panel(self):
         pal, S = self.pal, self.S
@@ -520,6 +583,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
         row_h = int(24 * S)
         gap = int(6 * S)
         max_x = w - int(2 * S)
+        self._tag_hits = []
         for tag in shown:
             name = str(tag.name or "")
             pct = float(getattr(tag, "pct", 0) or 0)
@@ -545,7 +609,22 @@ class StockDetailWindow(sb_ui.BaseDialog):
             c.create_text(x + chip_w - int(8 * S), y + row_h / 2,
                           text=pct_txt, anchor="e",
                           fill=D.change_color(pct, pal), font=F.tiny())
+            self._tag_hits.append((x, y, x + chip_w, y + row_h, tag))
             x += chip_w + gap
+
+        hidden = total - len(shown)
+        if hidden > 0:
+            more_txt = "+%d 全部" % hidden
+            more_w = F.tiny().measure(more_txt) + int(18 * S)
+            if x + more_w > max_x:
+                x = int(2 * S)
+                y += row_h + int(3 * S)
+            if y + row_h <= h:
+                draw_round_rect(c, x, y, x + more_w, y + row_h,
+                                int(7 * S), pal["panel_soft"], pal["border"], 1)
+                c.create_text(x + more_w / 2, y + row_h / 2, text=more_txt,
+                              fill=pal["accent"], font=F.tiny())
+                self._tag_hits.append((x, y, x + more_w, y + row_h, None))
 
     def _level_status_color(self, status: str):
         pal = self.pal
@@ -784,15 +863,13 @@ class StockDetailWindow(sb_ui.BaseDialog):
                 return "break"
             amount = max(1, abs(delta) // 120) * 3
             self.page_canvas.yview_scroll(-amount if delta > 0 else amount, "units")
-            self._enable_ai_auto()
         except tk.TclError:
             pass
-        self._schedule_ai_check()
         return "break"
 
     def _enable_ai_auto(self):
-        self._ai_auto_ready = True
-        self._schedule_ai_check(delay=120)
+        # 1.9.0: AI 研判改为手动点击，滚动只负责翻页，不再触发请求。
+        return
 
     def _scroll_page_to_widget(self, widget, margin=6):
         try:
@@ -808,9 +885,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
             pass
 
     def _jump_ai(self):
-        self._ai_auto_ready = True
         self._scroll_page_to_widget(self.ai_panel, margin=8)
-        self._schedule_ai_check(delay=260)
 
     def _jump_top(self):
         self._ai_auto_ready = False
@@ -946,6 +1021,18 @@ class StockDetailWindow(sb_ui.BaseDialog):
             self._search_results = []
             self._draw_left()
             return
+        if self.scope_tag is not None:
+            # 标签窗口内只过滤本标签成分，不查全市场。
+            q = text.lower()
+            self._search_results = [
+                D.Symbol(code=m.code, name=m.name)
+                for m in (self._tag_members or [])
+                if q in m.name.lower() or q in m.code or q in D.code_digits(m.code)
+            ][:50]
+            self._draw_left()
+            self._left_note(("%d 条结果" % len(self._search_results))
+                            if self._search_results else "无匹配")
+            return
         self._left_note("搜索中…")
 
         def work():
@@ -953,17 +1040,104 @@ class StockDetailWindow(sb_ui.BaseDialog):
                 found = D.search_symbols(text)
             except Exception:
                 found = []
-            # 行情条是 A 股工作台: 搜索里过滤港股/美股等同名噪声
-            results = [
-                s for s in (found or [])
-                if str(getattr(s, "code", "")).startswith(("sh", "sz", "bj"))
-            ][:30]
+            # 支持 A 股、港股、美股与 ETF；代码已由数据层统一（如 QQQ -> usQQQ）。
+            results = [s for s in (found or []) if getattr(s, "code", "")][:30]
             try:
                 self._async_q.put(("search", gen, text, results))
             except Exception:
                 pass
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _left_rows_data(self):
+        """左栏行数据: 自选 / 标签成分 / AI 选股结果 / 搜索结果。"""
+        searching = bool(self._search_text()) and bool(self._search_results)
+        if searching:
+            return [(s.code, s.name, None, None, True)
+                    for s in self._search_results]
+        if self._tag_pick_mode:
+            return [(m.code, m.name, m.price, m.pct, True)
+                    for m, _score, _reason in (self._tag_pick_results or [])]
+        if self.scope_tag is not None:
+            return [(m.code, m.name, m.price, m.pct, True)
+                    for m in (self._tag_members or [])]
+        return [(code, "", None, None, False) for code in (self.app.pick_codes or [])]
+
+    def _set_pick_status(self, text: str):
+        if self.pick_status is None:
+            return
+        try:
+            # 左栏较窄，避免状态文字把按钮挤走。
+            self.pick_status.configure(text=(text or "")[:24])
+        except tk.TclError:
+            pass
+
+    def _tag_pick_apply(self, results):
+        """results: [(member, score, reason)]，按数组顺序作为 AI/规则排名。"""
+        self._tag_pick_results = list(results or [])
+        self._tag_pick_rank = {}
+        self._tag_pick_reason = {}
+        for i, (m, _score, reason) in enumerate(self._tag_pick_results, 1):
+            self._tag_pick_rank[m.code] = i
+            self._tag_pick_reason[m.code] = reason or ""
+        self._tag_pick_mode = True
+        self._draw_left()
+
+    def _clear_tag_pick(self):
+        """返回标签全部成分，保留成员列表与 + 加自选。"""
+        self._tag_pick_gen += 1
+        self._tag_pick_busy = False
+        self._tag_pick_mode = False
+        self._tag_pick_results = []
+        self._tag_pick_rank = {}
+        self._tag_pick_reason = {}
+        self._tag_pick_candidates = []
+        self._set_pick_status("点 + 加自选")
+        self._draw_left()
+
+    def _start_tag_pick(self):
+        """手动触发: 规则初筛 20 只，再由 AI 大模型复核；不自动调用。"""
+        if self.scope_tag is None:
+            return
+        if self._tag_pick_busy:
+            return
+        members = list(self._tag_members or [])
+        if not members:
+            self._left_note("标签成分未加载，暂不能选股")
+            return
+        candidates = PK.rank_members(members, limit=24)
+        if not candidates:
+            self._left_note("没有可筛选的 A 股")
+            return
+        self._tag_pick_gen += 1
+        gen = self._tag_pick_gen
+        tag_code = str(getattr(self.scope_tag, "code", "") or "").upper()
+        tag_name = str(getattr(self.scope_tag, "name", "") or "")
+        self._tag_pick_candidates = candidates
+        initial = [(m, score, "规则初筛：涨幅/成交额/换手/量比综合排名")
+                   for m, score in candidates[:8]]
+        self._tag_pick_apply(initial)
+        if not (self.app.cfg.get("llm_enabled") and D.llm_key(self.app.cfg)):
+            self._set_pick_status("规则初筛 · 未启用AI")
+            self._left_note("已按量价规则初筛；配置 AI 后可模型复核")
+            return
+        self._tag_pick_busy = True
+        self._set_pick_status("AI 选股中…")
+        self._left_note("AI 正在复核 %d 只候选…" % len(candidates))
+
+        def work():
+            try:
+                picks, err = PK.select_with_ai(
+                    self.app.cfg, tag_name, candidates, timeout=45.0)
+            except Exception as exc:
+                picks, err = [], str(exc)
+            try:
+                self._async_q.put(("tag_pick", gen, tag_code, picks, err))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
 
     def _draw_left(self):
         c = getattr(self, "left_list", None)
@@ -981,20 +1155,39 @@ class StockDetailWindow(sb_ui.BaseDialog):
         h = max(1, c.winfo_height())
         self._left_rows = []
         searching = bool(self._search_text()) and bool(self._search_results)
-        if searching:
-            rows = [(s.code, s.name) for s in self._search_results]
-        else:
-            rows = [(code, "") for code in (self.app.pick_codes or [])]
+        rows = self._left_rows_data()
         if not rows:
-            tip = "没有匹配结果" if self._search_text() else "自选为空"
+            if self._tag_pick_mode:
+                tip = "AI 选股中…" if self._tag_pick_busy else "AI 未选出候选，点「全部」恢复"
+            elif self.scope_tag is not None and not self._tag_loaded:
+                tip = "加载成分股…"
+            elif self.scope_tag is not None:
+                tip = "该标签暂无 A 股成分"
+            else:
+                tip = "没有匹配结果" if self._search_text() else "自选为空"
             c.create_text(w / 2, int(22 * S), text=tip, anchor="n",
                           fill=pal["faint"], font=F.tiny())
-            c.configure(scrollregion=(0, 0, w, h))
+            self._left_draw_guard = True
+            try:
+                c.configure(scrollregion=(0, 0, w, h))
+            finally:
+                self._left_draw_guard = False
             return
         row_h = int(43 * S)
-        y = int(2 * S)
+        total = len(rows)
+        content_h = total * row_h + int(4 * S)
+        # 大板块(上千只)只画可视行，避免每次 2 秒刷新重画几千个 Canvas item。
+        visible = max(1, int(h / row_h) + 3)
+        if total > 80:
+            top = max(0, int(c.canvasy(0)) // row_h)
+            start = max(0, top - 1)
+            end = min(total, start + visible)
+        else:
+            start, end = 0, total
+        y = start * row_h + int(2 * S)
         plus_w = int(30 * S)
-        for code, name_hint in rows:
+        for idx in range(start, end):
+            code, name_hint, price_hint, pct_hint, is_search = rows[idx]
             q = (self.app.quotes or {}).get(code)
             name = ((q.name if q else "") or name_hint or
                     (getattr(self.app, "_detail_names", {}) or {}).get(code) or
@@ -1005,25 +1198,30 @@ class StockDetailWindow(sb_ui.BaseDialog):
                                 y + row_h - int(1 * S), int(5 * S),
                                 pal["selected"], "", 0)
             name_font = F.ui(-2, True)
-            price_w = int(62 * S) if q else int(0 * S)
+            rank = self._tag_pick_rank.get(code) if self._tag_pick_mode else 0
+            if rank:
+                name = "%d. %s" % (rank, name)
+            price_w = int(62 * S) if (q or (price_hint and price_hint > 0)) else 0
             max_name = max(20, w - int(10 * S) - plus_w - price_w - int(6 * S))
             label = sb_ui._fit_text(name_font, name, max_name)
             c.create_text(int(10 * S), y + int(7 * S), text=label, anchor="nw",
                           fill=pal["accent"] if selected else pal["text"],
                           font=name_font)
+            pct = D.today_pct(q) if q else pct_hint
             code_txt = D.code_digits(code)
-            if q:
-                pct = D.today_pct(q)
-                code_txt += "  " + (D.fmt_pct(pct) if pct is not None else "-")
+            if pct is not None:
+                code_txt += "  " + D.fmt_pct(pct)
             c.create_text(int(10 * S), y + int(25 * S), text=code_txt, anchor="nw",
                           fill=pal["muted"], font=F.num(-3, False))
-            if q:
-                col = D.change_color(D.today_pct(q), pal)
-                price_x = (w - plus_w - int(2 * S)) if searching else (w - int(8 * S))
+            price = q.price if q else (price_hint or 0)
+            dp = q.dp if q else (D._price_dp("%.2f" % price) if price else 2)
+            if price > 0:
+                col = D.change_color(pct, pal)
+                price_x = (w - plus_w - int(2 * S)) if is_search else (w - int(8 * S))
                 c.create_text(price_x, y + int(8 * S),
-                              text=D.fmt_price(q.price, q.dp), anchor="ne",
+                              text=D.fmt_price(price, dp), anchor="ne",
                               fill=col, font=F.num(-2, False))
-            if searching:
+            if is_search:
                 exists = code in (self.app.pick_codes or [])
                 bx1, bx2 = w - plus_w, w - int(4 * S)
                 by1, by2 = y + int(9 * S), y + int(31 * S)
@@ -1036,7 +1234,31 @@ class StockDetailWindow(sb_ui.BaseDialog):
             else:
                 self._left_rows.append((code, y, y + row_h, w + 1))
             y += row_h
-        c.configure(scrollregion=(0, 0, w, max(h, y + int(4 * S))))
+        self._left_draw_guard = True
+        try:
+            c.configure(scrollregion=(0, 0, w, max(h, content_h)))
+        finally:
+            self._left_draw_guard = False
+
+    def _left_scroll_cb(self, first, last):
+        try:
+            self.left_sb.set(first, last)
+        except tk.TclError:
+            return
+
+    def _left_sb_cmd(self, *args):
+        """滚动条拖动/翻页；滚动后重画虚拟列表。"""
+        try:
+            self.left_list.yview(*args)
+            if len(self._left_rows_data()) > 80:
+                self._draw_left()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _redraw_left_big(self):
+        self._left_draw_guard = False
+        self._draw_left()
 
     def _on_left_wheel(self, event):
         try:
@@ -1045,6 +1267,8 @@ class StockDetailWindow(sb_ui.BaseDialog):
             if (event.delta > 0 and first <= 0.0) or (event.delta < 0 and last >= 1.0):
                 return "break"
             c.yview_scroll(-3 if event.delta > 0 else 3, "units")
+            if len(self._left_rows_data()) > 80:
+                self._draw_left()
         except tk.TclError:
             pass
         return "break"
@@ -1074,6 +1298,10 @@ class StockDetailWindow(sb_ui.BaseDialog):
         self.show(code)
         if code not in (self.app.quotes or {}):
             self._fetch_quote(code)
+        if self._tag_pick_mode:
+            reason = self._tag_pick_reason.get(code)
+            if reason:
+                self._left_note("选股理由：%s" % reason)
 
     def _fetch_quote(self, code):
         code = D.normalize_code(code)
@@ -1125,34 +1353,12 @@ class StockDetailWindow(sb_ui.BaseDialog):
             if getattr(self, "left_note", None) else None)
 
     def _schedule_ai_check(self, delay=180):
-        job = getattr(self, "_ai_auto_job", None)
-        if job:
-            try:
-                self.win.after_cancel(job)
-            except tk.TclError:
-                pass
-        try:
-            self._ai_auto_job = self.win.after(delay, self._maybe_autogen_ai)
-        except tk.TclError:
-            self._ai_auto_job = None
+        # 1.9.0: 手动研判，保留方法名兼容旧调用，但不再自动排队。
+        return
 
     def _maybe_autogen_ai(self):
         self._ai_auto_job = None
-        if not self._ai_auto_ready or self._ai_busy or not self._viewable():
-            return
-        if not self.app.cfg.get("llm_enabled") or not D.llm_key(self.app.cfg):
-            self._render_ai()
-            return
-        if self._ai_visible() is False:
-            return
-        phase = A.phase_of()
-        r = self._ai_result
-        if r and r.phase_key == phase["key"] and \
-                time.strftime("%Y-%m-%d", time.localtime(r.generated_at or 0)) == phase["date"]:
-            return
-        if time.time() - self._ai_last_trigger < 12.0:
-            return
-        self._start_ai()
+        return
 
     def _ai_visible(self):
         """AI 面板露出足够多才自动请求，避免一开窗就偷偷消耗 token。"""
@@ -1314,6 +1520,93 @@ class StockDetailWindow(sb_ui.BaseDialog):
             self._daily_bars_cache[code] = (time.time(), list(bars))
         return bars
 
+    def set_scope(self, tag, code: str | None = None):
+        """切换标签成分范围（单例标签窗口复用）。"""
+        self.scope_tag = tag
+        self._tag_members = []
+        self._tag_member_by_code = {}
+        self._tag_loaded = False
+        self._tag_busy = False
+        self._tag_gen += 1
+        self._search_results = []
+        self._tag_pick_gen += 1
+        self._tag_pick_busy = False
+        self._tag_pick_mode = False
+        self._tag_pick_results = []
+        self._tag_pick_rank = {}
+        self._tag_pick_reason = {}
+        self._tag_pick_candidates = []
+        self._set_pick_status("点 + 加自选")
+        if code:
+            self.show(code)
+        else:
+            self.show(self.code)
+        self._start_tag_members()
+        try:
+            self.raise_()
+        except Exception:
+            pass
+
+    def _start_tag_members(self):
+        """后台拉取当前标签的全部 A 股成分；只对标签窗口生效。"""
+        if self.scope_tag is None or self._tag_busy:
+            return
+        self._tag_busy = True
+        self._tag_loaded = False
+        gen = self._tag_gen
+        tag_code = str(getattr(self.scope_tag, "code", "") or "").upper()
+
+        def work():
+            try:
+                members = SEC.fetch_members(tag_code)
+            except Exception:
+                members = []
+            try:
+                self._async_q.put(("tag_members", gen, tag_code, members))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_tag_click(self, event):
+        x = self.tags_canvas.canvasx(event.x)
+        y = self.tags_canvas.canvasy(event.y)
+        for x1, y1, x2, y2, tag in getattr(self, "_tag_hits", []):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                if tag is None:
+                    self._show_all_tags()
+                else:
+                    self.app.open_tag_stock_window(tag, self.code)
+                return "break"
+        return "break"
+
+    def _on_tag_motion(self, event):
+        x = self.tags_canvas.canvasx(event.x)
+        y = self.tags_canvas.canvasy(event.y)
+        over = any(x1 <= x <= x2 and y1 <= y <= y2 for x1, y1, x2, y2, _ in
+                   getattr(self, "_tag_hits", []))
+        try:
+            self.tags_canvas.configure(cursor="hand2" if over else "")
+        except tk.TclError:
+            pass
+
+    def _show_all_tags(self):
+        from sb_widgets import MenuPopup
+        items = []
+        for tag in self._sector_tags:
+            items.append({
+                "type": "cmd",
+                "label": "%s  %s" % (tag.kind_label, tag.name),
+                "command": (lambda t=tag: self.app.open_tag_stock_window(t, self.code)),
+            })
+        try:
+            root_x = self.tags_canvas.winfo_rootx() + int(8 * self.S)
+            root_y = self.tags_canvas.winfo_rooty() + int(64 * self.S)
+            MenuPopup(self.tags_canvas, items, self.pal, self.fonts,
+                      scale=self.S).show_at(root_x, root_y)
+        except Exception:
+            pass
+
     def _start_aux(self):
         """后台拉板块标签和日线，先渲染规则候选；AI 选点随后覆盖。"""
         code = self.code
@@ -1458,7 +1751,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
 
         if not self.app.cfg.get("llm_enabled") or not D.llm_key(self.app.cfg):
             box = section("AI", "尚未启用")
-            mk(box, "在设置 → AI 研判中启用并填写 API Key 后，这里会按当前阶段自动分析。",
+            mk(box, "在设置 → AI 研判中启用并填写 API Key 后，点右上角“重新研判”或下方“立即研判”生成。",
                F.ui(-2), pal["text_dim"])
             row = tk.Frame(box, bg=pal["panel_alt"])
             row.pack(fill="x", pady=(int(6 * S), 0))
@@ -1478,7 +1771,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
 
         if r is None:
             box = section("AI", "等待研判")
-            mk(box, "滚动到这里会自动研判；也可以点右上角“重新研判”立即生成。",
+            mk(box, "滚动到这里不会自动发送请求；点右上角“重新研判”或下方“立即研判”生成。",
                F.ui(-2), pal["text_dim"])
             row = tk.Frame(box, bg=pal["panel_alt"])
             row.pack(fill="x", pady=(int(6 * S), 0))
@@ -1674,7 +1967,7 @@ class StockDetailWindow(sb_ui.BaseDialog):
                 (getattr(self.app, "_detail_names", {}) or {}).get(code) or
                 D.code_digits(code)) or code
         try:
-            self.win.title("%s %s" % (name, D.code_digits(code)))
+            self.win.title(self._title_text(name, code))
         except tk.TclError:
             pass
         try:
@@ -1685,7 +1978,6 @@ class StockDetailWindow(sb_ui.BaseDialog):
             pass
         self._draw_all()
         self._draw_left()
-        self._schedule_ai_check(delay=400)
 
     def _request_minute(self):
         self.app.request_minutes(self.code, self._on_minutes)
@@ -1807,12 +2099,65 @@ class StockDetailWindow(sb_ui.BaseDialog):
                         self._draw_side()
                         self._draw_all()
                     self._draw_left()
+                elif kind == "tag_members":
+                    _, gen, tag_code, members = msg
+                    scope = self.scope_tag
+                    if scope is None or gen != self._tag_gen or \
+                            str(getattr(scope, "code", "")).upper() != tag_code:
+                        continue
+                    self._tag_busy = False
+                    self._tag_loaded = True
+                    self._tag_members = list(members or [])
+                    self._tag_member_by_code = {
+                        m.code: m for m in self._tag_members
+                    }
+                    if self._tag_members and self.code not in self._tag_member_by_code:
+                        self.show(self._tag_members[0].code)
+                    else:
+                        self._draw_left()
+                    try:
+                        name = ((self.q.name if self.q else "") or
+                                D.code_digits(self.code)) or self.code
+                        self.win.title(self._title_text(name, self.code))
+                    except tk.TclError:
+                        pass
+                    try:
+                        if self._tag_members:
+                            self.left_note.configure(
+                                text="%s · %d只" % (scope.name, len(self._tag_members)))
+                        else:
+                            err = SEC.member_last_error()
+                            if err:
+                                self._left_note("成分加载失败：%s" % err[:60])
+                            else:
+                                self._left_note("该标签暂无 A 股成分")
+                    except tk.TclError:
+                        pass
                 elif kind == "search":
                     _, gen, text, results = msg
                     if gen == self._search_gen and text == self._search_text():
                         self._search_results = results
                         self._left_note(("%d 条结果" % len(results)) if results else "无匹配")
                         self._draw_left()
+                elif kind == "tag_pick":
+                    _, gen, tag_code, picks, err = msg
+                    scope = self.scope_tag
+                    if scope is None or gen != self._tag_pick_gen or \
+                            str(getattr(scope, "code", "")).upper() != tag_code:
+                        continue
+                    self._tag_pick_busy = False
+                    if picks:
+                        scores = {m.code: score for m, score in self._tag_pick_candidates}
+                        results = [(m, scores.get(m.code, 0.0), reason)
+                                   for m, reason in picks]
+                        self._tag_pick_apply(results)
+                        self._set_pick_status("AI 已选 %d 只 · +加自选" % len(results))
+                        self._left_note("AI 选股完成：%d 只观察候选" % len(results))
+                        if self.code not in self._tag_pick_reason:
+                            self._open_symbol(results[0][0].code)
+                    else:
+                        self._set_pick_status("AI 失败 · 规则初筛")
+                        self._left_note("AI 未返回（%s），保留规则候选" % (err or "未知错误"))
                 elif kind == "aux":
                     _, gen, code, tags, plan = msg
                     if gen == self._aux_gen and code == self.code:
@@ -1964,20 +2309,27 @@ class StockDetailWindow(sb_ui.BaseDialog):
         # 右侧数据格(4 列 2 行)
         x0 = int(w * 0.44)
         cw = max(110, (w - x0 - pad) / 4.0)
+        overseas = q.code[:2] in ("us", "hk")
         stats = []
         if q.is_index:
-            vol_txt = D.fmt_volume(q.volume).replace("手", "股")
+            if q.code[:2] in ("us", "hk"):
+                vol_txt = D.fmt_quote_volume(q.code, q.volume)
+                amt_txt = D.fmt_quote_amount(q.code, q.amount)
+            else:
+                vol_txt = D.fmt_volume(q.volume).replace("手", "股")
+                amt_txt = D.fmt_amount(q.amount)
             stats = [("今开", D.fmt_price(q.open, q.dp)), ("最高", D.fmt_price(q.high, q.dp)),
                      ("最低", D.fmt_price(q.low, q.dp)), ("昨收", D.fmt_price(q.prev_close, q.dp)),
-                     ("成交量", vol_txt), ("成交额", D.fmt_amount(q.amount)),
+                     ("成交量", vol_txt), ("成交额", amt_txt),
                      ("振幅", "%.2f%%" % q.amplitude if q.amplitude else "-"),
                      ("时间", D.fmt_quote_time(q.time))]
         else:
             stats = [("今开", D.fmt_price(q.open, q.dp)), ("最高", D.fmt_price(q.high, q.dp)),
                      ("最低", D.fmt_price(q.low, q.dp)), ("昨收", D.fmt_price(q.prev_close, q.dp)),
-                     ("成交量", D.fmt_volume(q.volume)), ("成交额", D.fmt_amount(q.amount)),
-                     ("换手", "%.2f%%" % q.turnover if q.turnover else "-"),
-                     ("量比", "%.2f" % q.volume_ratio if q.volume_ratio else "-")]
+                     ("成交量", D.fmt_quote_volume(q.code, q.volume)),
+                     ("成交额", D.fmt_quote_amount(q.code, q.amount)),
+                     ("换手", "-" if overseas else ("%.2f%%" % q.turnover if q.turnover else "-")),
+                     ("量比", "-" if overseas else ("%.2f" % q.volume_ratio if q.volume_ratio else "-"))]
         for i, (k, v) in enumerate(stats):
             x = x0 + (i % 4) * cw
             y = int(16 * S) + (i // 4) * int(32 * S)
@@ -2053,6 +2405,33 @@ class StockDetailWindow(sb_ui.BaseDialog):
                         y += int(20 * S)
             c.create_text(pad, min(h - int(52 * S), y + int(14 * S)),
                           text="指数无五档盘口与逐笔明细。\n分时、K线支持滚轮缩放、拖动平移、双击复位。",
+                          anchor="nw", fill=pal["faint"], font=F.tiny(),
+                          width=max(100, w - 2 * pad))
+            return
+
+        if q.code[:2] in ("us", "hk"):
+            c.create_text(pad, int(10 * S), text="美股行情" if q.code.startswith("us") else "港股行情",
+                          anchor="nw", fill=pal["text"], font=F.ui(0, True))
+            rows = [
+                ("最新", D.fmt_price(q.price, q.dp)),
+                ("涨跌", D.fmt_change(q.change, q.dp) + "  " + D.fmt_pct(D.today_pct(q))),
+                ("今开", D.fmt_price(q.open, q.dp)),
+                ("最高", D.fmt_price(q.high, q.dp)),
+                ("最低", D.fmt_price(q.low, q.dp)),
+                ("昨收", D.fmt_price(q.prev_close, q.dp)),
+                ("成交量", D.fmt_quote_volume(q.code, q.volume)),
+                ("成交额", D.fmt_quote_amount(q.code, q.amount)),
+                ("振幅", "%.2f%%" % q.amplitude if q.amplitude else "-"),
+                ("时间", D.fmt_quote_time(q.time)),
+            ]
+            y = int(36 * S)
+            for k, v in rows:
+                c.create_text(pad, y, text=k, anchor="w", fill=pal["muted"], font=F.tiny())
+                c.create_text(w - pad, y, text=v, anchor="e", fill=pal["text_dim"],
+                              font=F.num(-2, False))
+                y += int(22 * S)
+            c.create_text(pad, min(h - int(56 * S), y + int(14 * S)),
+                          text="海外标的暂无五档盘口与逐笔明细。\n分时、日K、周K、月K可用；休市时分时只显示最新价。",
                           anchor="nw", fill=pal["faint"], font=F.tiny(),
                           width=max(100, w - 2 * pad))
             return
@@ -2261,6 +2640,10 @@ class StockDetailWindow(sb_ui.BaseDialog):
                           else "暂无分时数据", fill=pal["faint"], font=F.label())
             self._plot = {"kind": "minute", "empty": True}
             return
+        if len(pts) <= 1 and self.code[:2] in ("us", "hk"):
+            c.create_text((x1 + x2) / 2, y1 + int(18 * S),
+                          text="海外行情：分时仅最新价，切日K看历史",
+                          fill=pal["faint"], font=F.tiny())
         if self._view is None:
             self._view = (0.0, float(total))
         start, end = self._view
@@ -2780,3 +3163,12 @@ class StockDetailWindow(sb_ui.BaseDialog):
                 pass
         self._after_ids = []
         super().close()
+
+
+class TagStockWindow(StockDetailWindow):
+    """板块/概念标签成分窗口：左栏列出标签内全部 A 股，右侧复用详细图表。"""
+
+    key = "tag_stocks"
+
+    def __init__(self, app, tag, code: str):
+        super().__init__(app, code, scope_tag=tag, layout_prefix="tag_stock")

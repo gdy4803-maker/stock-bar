@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""沪深实时行情桌面导航栏 (StockBar) v1.2
+"""股票智能选股悬浮窗 (StockPick)
 ============================================
-一个极简的 Windows 桌面行情条: 胶囊样式, 悬浮在桌面/任务栏上, 只显示涨跌幅。
+基于 AI 大模型的桌面选股悬浮窗：行情、板块成分、标签内选股与 AI 研判压缩在一条悬浮条上。
   - 左边: 当前自选股涨跌幅(点击/方向键切换)
   - 中间: 持仓当日盈亏(有持仓时显示)
   - 右边: 指数涨跌幅
@@ -49,8 +49,9 @@ from sb_theme import (Fonts, KEY_COLOR, Screen, darken, draw_round_rect,
                       set_topmost, set_window_alpha)
 from sb_widgets import MenuPopup
 
-APP_NAME = "沪深行情导航栏"
-APP_VERSION = "1.8.1"
+APP_NAME = "股票智能选股悬浮窗"
+APP_NAME_EN = "StockPick"
+APP_VERSION = "2.0.1"
 REPO_URL = "https://github.com/gdy4803-maker/stock-bar"
 
 if getattr(sys, "frozen", False):
@@ -84,6 +85,7 @@ DEFAULT_CONFIG = {
     "cn_colors": True,        # True=红涨绿跌, False=绿涨红跌
     "card_mode": "detail",    # detail=详细(含分时图) | simple=简洁(纯文字)
     "card_opacity": 1.0,      # 悬停卡片透明度 0.10 ~ 1.0
+    "window_opacity": 1.0,    # 所有弹窗/详细窗口不透明度 0.40 ~ 1.0
     "pnl_display": "money",   # 行情条持仓段显示: money=当日盈亏金额 | pct=涨幅
     "dock_taskbar": False,    # True=嵌入任务栏(左), 拖动只在任务栏内滑动
 }
@@ -163,6 +165,11 @@ def normalize_config(raw: dict | None) -> dict:
     except (TypeError, ValueError):
         card_op = 1.0
     cfg["card_opacity"] = max(0.10, min(1.0, card_op))
+    try:
+        win_op = float(cfg.get("window_opacity", 1.0))
+    except (TypeError, ValueError):
+        win_op = 1.0
+    cfg["window_opacity"] = max(0.40, min(1.0, win_op))
     if cfg.get("pnl_display") not in ("money", "pct"):
         cfg["pnl_display"] = "money"
     if cfg.get("theme") not in ("dark", "light"):
@@ -567,6 +574,8 @@ class StockBar:
 
     def __init__(self, cfg: dict):
         self.version = APP_VERSION
+        self.name = APP_NAME
+        self.name_en = APP_NAME_EN
         self.repo_url = REPO_URL
         self.base_dir = BASE_DIR
         self.cfg = normalize_config(cfg)
@@ -2005,6 +2014,26 @@ class StockBar:
             import traceback
             self._log("打开股票详情失败:\n" + traceback.format_exc())
 
+    def open_tag_stock_window(self, tag, code: str | None = None):
+        """打开标签成分窗口（单例）；code 为当前来源股票，优先选中它。"""
+        code = D.normalize_code(code or self._current_pick_code())
+        if not code:
+            return
+        win = self._dialogs.get("tag_stocks")
+        if win is not None:
+            try:
+                win.set_scope(tag, code)
+                win.raise_()
+                return
+            except Exception:
+                self._dialogs.pop("tag_stocks", None)
+        self._hide_card()
+        try:
+            sb_detail.TagStockWindow(self, tag, code)
+        except Exception:
+            import traceback
+            self._log("打开标签成分窗口失败:\n" + traceback.format_exc())
+
     # ---------- 任务栏嵌入 ----------
     def _dock_pos(self, w: int | None = None, h: int | None = None,
                   rescan: bool = True, x_hint: int | None = None) -> tuple[int, int]:
@@ -2280,7 +2309,7 @@ def check_mode() -> int:
                   D.fmt_quote_time(q.time) + tag)
         else:
             print(_fit(code, 10) + "无数据")
-    print(f"\n共获取 {len(quotes)} 条。代码格式: sh600519 / sz000001 / hk00700 / usAAPL。")
+    print(f"\n共获取 {len(quotes)} 条。代码格式: sh600519 / sz000001 / hk00700 / usAAPL / QQQ。")
     return 0
 
 
@@ -2374,7 +2403,7 @@ def main() -> int:
         print(__doc__)
         return 0
     if "--version" in sys.argv or "-v" in sys.argv:
-        print(f"{APP_NAME} v{APP_VERSION}")
+        print(f"{APP_NAME} · {APP_NAME_EN} v{APP_VERSION}")
         return 0
     if "--autostart" in sys.argv:
         enable = "--on" in sys.argv
